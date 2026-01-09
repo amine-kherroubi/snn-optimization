@@ -1,5 +1,7 @@
-gcc -o nn_pthreads nn_pthreads.c -lm -pthread -pg -fopenmp
+# Compile pthreads version
+gcc -o reference/nn_pthreads reference/nn_pthreads.c -lm -pthread -pg -fopenmp
 
-# ./nn_pthreads ./data/synthetic_convex_small.csv
-# ./nn_pthreads ./data/synthetic_convex_medium.csv
-./nn_pthreads ./data/synthetic_convex_large.csv
+# Run pthreads version on large dataset
+# ./reference/nn_pthreads reference/data/synthetic_convex_small.csv
+# ./reference/nn_pthreads reference/data/synthetic_convex_medium.csv
+./reference/nn_pthreads reference/data/synthetic_convex_large.csv

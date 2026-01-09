@@ -48,8 +48,10 @@ data = np.hstack((X, Y.reshape(-1, 1)))
 df = pd.DataFrame(data, columns=columns)
 
 # Save to CSV
-os.makedirs("data", exist_ok=True)
+os.makedirs("reference/data", exist_ok=True)
 df.to_csv(
-    f"data/synthetic_{function_choice.value}_large.csv", index=False, header=False
+    f"reference/data/synthetic_{function_choice.value}_large.csv",
+    index=False,
+    header=False,
 )
 print(f"Dataset 'synthetic_{function_choice.value}_large.csv' generated successfully.")

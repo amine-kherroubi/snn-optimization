@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 
-file_path = "log/history.txt"
-output_image_path = "log/training.png"
+file_path = "reference/log/history.txt"
+output_image_path = "reference/log/training.png"
 
 epochs = []
 mse_values = []

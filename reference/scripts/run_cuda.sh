@@ -1,5 +1,7 @@
-nvcc -o nn_cuda nn_cuda.cu -Xcompiler -fopenmp
+# Compile CUDA version
+nvcc -o reference/nn_cuda reference/nn_cuda.cu -Xcompiler -fopenmp
 
-# ./nn_cuda ./data/synthetic_convex_small.csv
-# ./nn_cuda ./data/synthetic_convex_medium.csv
-./nn_cuda ./data/synthetic_convex_large.csv
+# Run CUDA version on large dataset
+# ./reference/nn_cuda reference/data/synthetic_convex_small.csv
+# ./reference/nn_cuda reference/data/synthetic_convex_medium.csv
+./reference/nn_cuda reference/data/synthetic_convex_large.csv
