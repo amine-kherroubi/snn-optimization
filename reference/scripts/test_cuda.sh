@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Compile test_cuda
+nvcc -o ../test_cuda ../test_cuda.cu
 
-nvcc -o "$ROOT_DIR/test_cuda" "$ROOT_DIR/test_cuda.cu"
-"$ROOT_DIR/test_cuda"
+# Run it
+../test_cuda
