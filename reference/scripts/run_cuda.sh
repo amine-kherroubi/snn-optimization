@@ -2,7 +2,7 @@
 set -e
 
 # Array of CUDA variants to test
-variants=("ref" "streams" "pinned" "persistent")
+variants=("ref" "streams" "pinned" "ALL")
 
 # Compile all variants
 echo "=============================="
