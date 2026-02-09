@@ -16,7 +16,7 @@
 #define THREADS_PER_BLOCK 16
 #define NUM_TEST_RUNS 10 // Number of times to run training for averaging
 #define NUM_STREAMS 3
-#define TILE_ROWS 256
+#define TILE_ROWS 128
 
 // ! Data Structures
 typedef struct {
