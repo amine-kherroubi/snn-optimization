@@ -7,10 +7,10 @@
 #include <string.h>
 
 // ! Network Parameters
-#define INPUT_SIZE 32     // Number of input features
-#define HIDDEN_SIZE 256   // Number of neurons in the hidden layer
-#define OUTPUT_SIZE 1     // Number of output neurons
-#define EPOCHS 100        // Number of training epochs
+#define INPUT_SIZE 32   // Number of input features
+#define HIDDEN_SIZE 256 // Number of neurons in the hidden layer
+#define OUTPUT_SIZE 1   // Number of output neurons
+#define EPOCHS 100      // Number of training epochs
 #define LEARNING_RATE 0.002
 #define BATCH_SIZE 256 // Batch size for SGD
 #define THREADS_PER_BLOCK 16
@@ -33,7 +33,8 @@ Matrix *allocate_matrix(int rows, int cols) {
   m->rows = rows;
   m->cols = cols;
   // Pinned (page-locked) host memory for async transfers
-  cudaError_t err = cudaMallocHost((void **)&m->data, rows * cols * sizeof(float));
+  cudaError_t err =
+      cudaMallocHost((void **)&m->data, rows * cols * sizeof(float));
   if (err != cudaSuccess) {
     m->data = (float *)malloc(rows * cols * sizeof(float));
   }
@@ -42,8 +43,9 @@ Matrix *allocate_matrix(int rows, int cols) {
 
 // Function to free a matrix
 void free_matrix(Matrix *m) {
-  // If allocated with cudaMallocHost, cudaFreeHost is safe; otherwise it is not.
-  // Use a heuristic: attempt cudaFreeHost first, fall back to free on error.
+  // If allocated with cudaMallocHost, cudaFreeHost is safe; otherwise it is
+  // not. Use a heuristic: attempt cudaFreeHost first, fall back to free on
+  // error.
   cudaError_t err = cudaFreeHost(m->data);
   if (err != cudaSuccess) {
     free(m->data);
@@ -110,14 +112,17 @@ Matrix *mat_mult(Matrix *A, Matrix *B) {
   }
 
   // Tile by rows of A/C
-  for (int row_start = 0, tile_idx = 0; row_start < A->rows; row_start += TILE_ROWS, tile_idx++) {
-    int tile_rows = (row_start + TILE_ROWS <= A->rows) ? TILE_ROWS : (A->rows - row_start);
+  for (int row_start = 0, tile_idx = 0; row_start < A->rows;
+       row_start += TILE_ROWS, tile_idx++) {
+    int tile_rows =
+        (row_start + TILE_ROWS <= A->rows) ? TILE_ROWS : (A->rows - row_start);
     int s = tile_idx % NUM_STREAMS;
 
     // H2D copy for tile of A (async)
     const float *A_tile_host = A->data + row_start * A->cols;
-    cudaMemcpyAsync(d_A_tiles[s], A_tile_host, tile_rows * A->cols * sizeof(float),
-                    cudaMemcpyHostToDevice, streams[s]);
+    cudaMemcpyAsync(d_A_tiles[s], A_tile_host,
+                    tile_rows * A->cols * sizeof(float), cudaMemcpyHostToDevice,
+                    streams[s]);
 
     // Kernel on tile
     dim3 threadsPerBlock(THREADS_PER_BLOCK, THREADS_PER_BLOCK);
@@ -129,8 +134,9 @@ Matrix *mat_mult(Matrix *A, Matrix *B) {
 
     // D2H copy for tile of C (async)
     float *C_tile_host = C->data + row_start * C->cols;
-    cudaMemcpyAsync(C_tile_host, d_C_tiles[s], tile_rows * B->cols * sizeof(float),
-                    cudaMemcpyDeviceToHost, streams[s]);
+    cudaMemcpyAsync(C_tile_host, d_C_tiles[s],
+                    tile_rows * B->cols * sizeof(float), cudaMemcpyDeviceToHost,
+                    streams[s]);
   }
 
   // Ensure all queued work completes
@@ -354,7 +360,7 @@ int main(int argc, char *argv[]) {
         Matrix *Z1 = mat_mult(X_batch, W1);
         relu(Z1);
         Matrix *Y_pred = mat_mult(Z1, W2);
-        
+
         // Compute loss
         float loss = mean_squared_error(Y_pred, Y_batch);
 
@@ -379,8 +385,8 @@ int main(int argc, char *argv[]) {
   }
 
   // Print average training time
-  printf("Average training time over %d runs: %.4f seconds\n", 
-         NUM_TEST_RUNS, total_time / NUM_TEST_RUNS);
+  printf("Average training time over %d runs: %.4f seconds\n", NUM_TEST_RUNS,
+         total_time / NUM_TEST_RUNS);
 
   // Cleanup data
   free_matrix(X);

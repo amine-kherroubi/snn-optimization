@@ -7,10 +7,10 @@
 #include <string.h>
 
 // ! Network Parameters
-#define INPUT_SIZE 32     // Number of input features
-#define HIDDEN_SIZE 256   // Number of neurons in the hidden layer
-#define OUTPUT_SIZE 1     // Number of output neurons
-#define EPOCHS 100        // Number of training epochs
+#define INPUT_SIZE 32   // Number of input features
+#define HIDDEN_SIZE 256 // Number of neurons in the hidden layer
+#define OUTPUT_SIZE 1   // Number of output neurons
+#define EPOCHS 100      // Number of training epochs
 #define LEARNING_RATE 0.002
 #define BATCH_SIZE 256 // Batch size for SGD
 #define THREADS_PER_BLOCK 16
@@ -326,7 +326,7 @@ int main(int argc, char *argv[]) {
         Matrix *Z1 = mat_mult(X_batch, W1);
         relu(Z1);
         Matrix *Y_pred = mat_mult(Z1, W2);
-        
+
         // Compute loss
         float loss = mean_squared_error(Y_pred, Y_batch);
 
@@ -351,8 +351,8 @@ int main(int argc, char *argv[]) {
   }
 
   // Print average training time
-  printf("Average training time over %d runs: %.4f seconds\n", 
-         NUM_TEST_RUNS, total_time / NUM_TEST_RUNS);
+  printf("Average training time over %d runs: %.4f seconds\n", NUM_TEST_RUNS,
+         total_time / NUM_TEST_RUNS);
 
   // Cleanup data
   free_matrix(X);

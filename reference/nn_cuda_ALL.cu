@@ -7,10 +7,10 @@
 #include <string.h>
 
 // ! Network Parameters
-#define INPUT_SIZE 32     // Number of input features
-#define HIDDEN_SIZE 256   // Number of neurons in the hidden layer
-#define OUTPUT_SIZE 1     // Number of output neurons
-#define EPOCHS 100        // Number of training epochs
+#define INPUT_SIZE 32   // Number of input features
+#define HIDDEN_SIZE 256 // Number of neurons in the hidden layer
+#define OUTPUT_SIZE 1   // Number of output neurons
+#define EPOCHS 100      // Number of training epochs
 #define LEARNING_RATE 0.002
 #define BATCH_SIZE 256 // Batch size for SGD
 #define THREADS_PER_BLOCK 16
@@ -41,32 +41,35 @@ typedef struct {
 static GlobalGPUContext g_gpu_ctx = {0};
 
 void init_global_gpu_context(int tile_rows, int A_cols, int B_cols) {
-  if (g_gpu_ctx.initialized) return;
-  
+  if (g_gpu_ctx.initialized)
+    return;
+
   g_gpu_ctx.tile_bytes_A = tile_rows * A_cols * sizeof(float);
   g_gpu_ctx.tile_bytes_C = tile_rows * B_cols * sizeof(float);
   g_gpu_ctx.cached_B_size = 0;
-  
+
   for (int s = 0; s < NUM_STREAMS; s++) {
     cudaMalloc((void **)&g_gpu_ctx.d_A_tiles[s], g_gpu_ctx.tile_bytes_A);
     cudaMalloc((void **)&g_gpu_ctx.d_C_tiles[s], g_gpu_ctx.tile_bytes_C);
     cudaStreamCreate(&g_gpu_ctx.streams[s]);
   }
-  
+
   g_gpu_ctx.d_B_cache = NULL;
   g_gpu_ctx.initialized = 1;
 }
 
 void cleanup_global_gpu_context() {
-  if (!g_gpu_ctx.initialized) return;
-  
+  if (!g_gpu_ctx.initialized)
+    return;
+
   for (int s = 0; s < NUM_STREAMS; s++) {
     cudaFree(g_gpu_ctx.d_A_tiles[s]);
     cudaFree(g_gpu_ctx.d_C_tiles[s]);
     cudaStreamDestroy(g_gpu_ctx.streams[s]);
   }
-  
-  if (g_gpu_ctx.d_B_cache) cudaFree(g_gpu_ctx.d_B_cache);
+
+  if (g_gpu_ctx.d_B_cache)
+    cudaFree(g_gpu_ctx.d_B_cache);
   g_gpu_ctx.initialized = 0;
 }
 
@@ -77,7 +80,8 @@ Matrix *allocate_matrix(int rows, int cols) {
   m->rows = rows;
   m->cols = cols;
   m->pinned = 1;
-  cudaError_t err = cudaMallocHost((void **)&m->data, rows * cols * sizeof(float));
+  cudaError_t err =
+      cudaMallocHost((void **)&m->data, rows * cols * sizeof(float));
   if (err != cudaSuccess) {
     m->data = (float *)malloc(rows * cols * sizeof(float));
     m->pinned = 0;
@@ -87,8 +91,10 @@ Matrix *allocate_matrix(int rows, int cols) {
 
 // Function to free a matrix
 void free_matrix(Matrix *m) {
-  if (m->pinned) cudaFreeHost(m->data);
-  else free(m->data);
+  if (m->pinned)
+    cudaFreeHost(m->data);
+  else
+    free(m->data);
   free(m);
 }
 
@@ -136,20 +142,24 @@ Matrix *mat_mult(Matrix *A, Matrix *B) {
 
   // Reuse or reallocate B cache if size changed
   if (g_gpu_ctx.cached_B_size != sizeB) {
-    if (g_gpu_ctx.d_B_cache) cudaFree(g_gpu_ctx.d_B_cache);
+    if (g_gpu_ctx.d_B_cache)
+      cudaFree(g_gpu_ctx.d_B_cache);
     cudaMalloc((void **)&g_gpu_ctx.d_B_cache, sizeB);
     cudaMemcpy(g_gpu_ctx.d_B_cache, B->data, sizeB, cudaMemcpyHostToDevice);
     g_gpu_ctx.cached_B_size = sizeB;
   }
 
   // Tile by rows of A/C with triple buffering and async copies
-  for (int row_start = 0, tile_idx = 0; row_start < A->rows; row_start += TILE_ROWS, tile_idx++) {
-    int tile_rows = (row_start + TILE_ROWS <= A->rows) ? TILE_ROWS : (A->rows - row_start);
+  for (int row_start = 0, tile_idx = 0; row_start < A->rows;
+       row_start += TILE_ROWS, tile_idx++) {
+    int tile_rows =
+        (row_start + TILE_ROWS <= A->rows) ? TILE_ROWS : (A->rows - row_start);
     int s = tile_idx % NUM_STREAMS;
 
     const float *A_tile_host = A->data + row_start * A->cols;
-    cudaMemcpyAsync(g_gpu_ctx.d_A_tiles[s], A_tile_host, tile_rows * A->cols * sizeof(float),
-                    cudaMemcpyHostToDevice, g_gpu_ctx.streams[s]);
+    cudaMemcpyAsync(g_gpu_ctx.d_A_tiles[s], A_tile_host,
+                    tile_rows * A->cols * sizeof(float), cudaMemcpyHostToDevice,
+                    g_gpu_ctx.streams[s]);
 
     dim3 threadsPerBlock(THREADS_PER_BLOCK, THREADS_PER_BLOCK);
     dim3 numBlocks((B->cols + threadsPerBlock.x - 1) / threadsPerBlock.x,
@@ -160,8 +170,9 @@ Matrix *mat_mult(Matrix *A, Matrix *B) {
         tile_rows, A->cols, B->cols);
 
     float *C_tile_host = C->data + row_start * C->cols;
-    cudaMemcpyAsync(C_tile_host, g_gpu_ctx.d_C_tiles[s], tile_rows * B->cols * sizeof(float),
-                    cudaMemcpyDeviceToHost, g_gpu_ctx.streams[s]);
+    cudaMemcpyAsync(C_tile_host, g_gpu_ctx.d_C_tiles[s],
+                    tile_rows * B->cols * sizeof(float), cudaMemcpyDeviceToHost,
+                    g_gpu_ctx.streams[s]);
   }
 
   // Synchronize all streams
@@ -380,7 +391,7 @@ int main(int argc, char *argv[]) {
         Matrix *Z1 = mat_mult(X_batch, W1);
         relu(Z1);
         Matrix *Y_pred = mat_mult(Z1, W2);
-        
+
         // Compute loss
         float loss = mean_squared_error(Y_pred, Y_batch);
 
@@ -405,8 +416,8 @@ int main(int argc, char *argv[]) {
   }
 
   // Print average training time
-  printf("Average training time over %d runs: %.4f seconds\n", 
-         NUM_TEST_RUNS, total_time / NUM_TEST_RUNS);
+  printf("Average training time over %d runs: %.4f seconds\n", NUM_TEST_RUNS,
+         total_time / NUM_TEST_RUNS);
 
   // Cleanup data
   free_matrix(X);
