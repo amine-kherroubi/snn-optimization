@@ -1,21 +1,20 @@
 #!/usr/bin/env bash
 set -e
 
-# Compile sequential version
-gcc -o ../nn ../nn.c -lm -pg -fopenmp
+# Compile CUDA version
+nvcc -o ../nn_cuda ../nn_cuda.cu -Xcompiler -fopenmp \
+  -gencode arch=compute_75,code=sm_75 \
+  -Xptxas=-v && echo "Compiled nn_cuda.cu successfully"
 
-# Run sequential version on the datasets
+# Run CUDA version on the datasets
 
 echo "Small Dataset (256 samples)"
-../nn ../data/synthetic_convex_small.csv
+../nn_cuda ../data/synthetic_convex_small.csv
 echo
 
 # echo "Medium Dataset (1024 samples)"
-# ../nn ../data/synthetic_convex_medium.csv
+# ../nn_cuda ../data/synthetic_convex_medium.csv
 # echo
 
 # echo "Large Dataset (4096 samples)"
-# ../nn ../data/synthetic_convex_large.csv
-
-# Run sequential version and log output
-# ../nn ../data/synthetic_convex_large.csv > ../log/log.txt
+# ../nn_cuda ../data/synthetic_convex_large.csv
