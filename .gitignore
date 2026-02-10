@@ -1,14 +1,10 @@
-# =========================
 # OS / filesystem junk
-# =========================
 .DS_Store
 Thumbs.db
 ehthumbs.db
 Desktop.ini
 
-# =========================
 # Editors / IDEs
-# =========================
 .vscode/
 .idea/
 *.swp
@@ -16,9 +12,7 @@ Desktop.ini
 *~
 *.bak
 
-# =========================
 # Python
-# =========================
 __pycache__/
 *.py[cod]
 *$py.class
@@ -40,9 +34,6 @@ dist/
 .coverage
 htmlcov/
 
-# =========================
-# C / C++ / CUDA
-# =========================
 # Object files
 *.o
 *.obj
@@ -74,9 +65,6 @@ htmlcov/
 *.cu.cpp
 *.cu.o
 
-# =========================
-# Build systems
-# =========================
 # CMake
 CMakeFiles/
 CMakeCache.txt
@@ -98,26 +86,18 @@ config.status
 bazel-*
 *.runfiles
 
-# =========================
 # Logs and temp files
-# =========================
 *.log
 *.tmp
 *.temp
 
-# =========================
 # Jupyter / notebooks
-# =========================
 .ipynb_checkpoints/
 
-# =========================
 # Docker
-# =========================
 *.tar
 
-# =========================
 # Project-specific (common)
-# =========================
 build/
 bin/
 lib/
