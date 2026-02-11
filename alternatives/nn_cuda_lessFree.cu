@@ -33,13 +33,13 @@ typedef struct
 // Global GPU context to avoid repeated allocations
 typedef struct
 {
-    float *d_B_cache;
     float *d_A_tiles[NUM_STREAMS];
     float *d_C_tiles[NUM_STREAMS];
     cudaStream_t streams[NUM_STREAMS];
     size_t tile_bytes_A;
     size_t tile_bytes_C;
-    size_t cached_B_size;
+    int max_A_cols;  // Add: Track max A columns for tile allocation
+    int max_B_cols;  // Add: Track max B columns for tile allocation
     int initialized;
 } GlobalGPUContext;
 
@@ -153,23 +153,60 @@ void cleanup_matrix_pool()
 // Resize a pool matrix for a smaller batch (just adjust rows, no realloc)
 void pool_matrix_set_rows(Matrix *m, int rows) { m->rows = rows; }
 
-void init_global_gpu_context(int tile_rows, int A_cols, int B_cols)
+void ensure_tile_capacity(int A_cols, int B_cols)
+{
+    size_t required_A = TILE_ROWS * A_cols * sizeof(float);
+    size_t required_C = TILE_ROWS * B_cols * sizeof(float);
+
+    int needs_realloc = 0;
+
+    // Check if we need larger A tiles
+    if (required_A > g_gpu_ctx.tile_bytes_A)
+    {
+        g_gpu_ctx.tile_bytes_A = required_A;
+        g_gpu_ctx.max_A_cols = A_cols;
+        needs_realloc = 1;
+    }
+
+    // Check if we need larger C tiles
+    if (required_C > g_gpu_ctx.tile_bytes_C)
+    {
+        g_gpu_ctx.tile_bytes_C = required_C;
+        g_gpu_ctx.max_B_cols = B_cols;
+        needs_realloc = 1;
+    }
+
+    if (needs_realloc)
+    {
+        // Reallocate tiles for all streams
+        for (int s = 0; s < NUM_STREAMS; s++)
+        {
+            if (g_gpu_ctx.d_A_tiles[s]) cudaFree(g_gpu_ctx.d_A_tiles[s]);
+            if (g_gpu_ctx.d_C_tiles[s]) cudaFree(g_gpu_ctx.d_C_tiles[s]);
+
+            cudaMalloc((void **)&g_gpu_ctx.d_A_tiles[s], g_gpu_ctx.tile_bytes_A);
+            cudaMalloc((void **)&g_gpu_ctx.d_C_tiles[s], g_gpu_ctx.tile_bytes_C);
+        }
+    }
+}
+
+void init_global_gpu_context()
 {
     if (g_gpu_ctx.initialized)
         return;
 
-    g_gpu_ctx.tile_bytes_A = tile_rows * A_cols * sizeof(float);
-    g_gpu_ctx.tile_bytes_C = tile_rows * B_cols * sizeof(float);
-    g_gpu_ctx.cached_B_size = 0;
+    g_gpu_ctx.tile_bytes_A = 0;
+    g_gpu_ctx.tile_bytes_C = 0;
+    g_gpu_ctx.max_A_cols = 0;
+    g_gpu_ctx.max_B_cols = 0;
 
     for (int s = 0; s < NUM_STREAMS; s++)
     {
-        cudaMalloc((void **)&g_gpu_ctx.d_A_tiles[s], g_gpu_ctx.tile_bytes_A);
-        cudaMalloc((void **)&g_gpu_ctx.d_C_tiles[s], g_gpu_ctx.tile_bytes_C);
+        g_gpu_ctx.d_A_tiles[s] = NULL;
+        g_gpu_ctx.d_C_tiles[s] = NULL;
         cudaStreamCreate(&g_gpu_ctx.streams[s]);
     }
 
-    g_gpu_ctx.d_B_cache = NULL;
     g_gpu_ctx.initialized = 1;
 }
 
@@ -185,8 +222,6 @@ void cleanup_global_gpu_context()
         cudaStreamDestroy(g_gpu_ctx.streams[s]);
     }
 
-    if (g_gpu_ctx.d_B_cache)
-        cudaFree(g_gpu_ctx.d_B_cache);
     g_gpu_ctx.initialized = 0;
 }
 
@@ -269,18 +304,16 @@ void mat_mult_into(Matrix *A, Matrix *B, Matrix *C)
     // Initialize GPU context on first call
     if (!g_gpu_ctx.initialized)
     {
-        init_global_gpu_context(TILE_ROWS, A->cols, B->cols);
+        init_global_gpu_context();
     }
 
-    // Reuse or reallocate B cache if size changed
-    if (g_gpu_ctx.cached_B_size != sizeB)
-    {
-        if (g_gpu_ctx.d_B_cache)
-            cudaFree(g_gpu_ctx.d_B_cache);
-        cudaMalloc((void **)&g_gpu_ctx.d_B_cache, sizeB);
-        cudaMemcpy(g_gpu_ctx.d_B_cache, B->data, sizeB, cudaMemcpyHostToDevice);
-        g_gpu_ctx.cached_B_size = sizeB;
-    }
+    // Ensure tile buffers are large enough for this operation
+    ensure_tile_capacity(A->cols, B->cols);
+
+    // Allocate B for this operation (NO CACHING - prevents stale data bugs)
+    float *d_B;
+    cudaMalloc((void **)&d_B, sizeB);
+    cudaMemcpy(d_B, B->data, sizeB, cudaMemcpyHostToDevice);
 
     // Tile by rows of A/C with triple buffering and async copies
     for (int row_start = 0, tile_idx = 0; row_start < A->rows;
@@ -300,7 +333,7 @@ void mat_mult_into(Matrix *A, Matrix *B, Matrix *C)
                        (tile_rows + threadsPerBlock.y - 1) / threadsPerBlock.y);
 
         mat_mult_kernel<<<numBlocks, threadsPerBlock, 0, g_gpu_ctx.streams[s]>>>(
-            g_gpu_ctx.d_A_tiles[s], g_gpu_ctx.d_B_cache, g_gpu_ctx.d_C_tiles[s],
+            g_gpu_ctx.d_A_tiles[s], d_B, g_gpu_ctx.d_C_tiles[s],
             tile_rows, A->cols, B->cols);
 
         float *C_tile_host = C->data + row_start * C->cols;
@@ -314,6 +347,9 @@ void mat_mult_into(Matrix *A, Matrix *B, Matrix *C)
     {
         cudaStreamSynchronize(g_gpu_ctx.streams[s]);
     }
+
+    // Free B for this operation
+    cudaFree(d_B);
 }
 
 // In-place matrix subtraction: C = A - B (writes into C)
@@ -516,6 +552,7 @@ int main(int argc, char *argv[])
 
     double start_time, end_time;
     double total_time = 0.0;
+    float total_final_mse = 0.0f;
 
     Matrix *X, *Y;
     int num_samples;
@@ -537,6 +574,8 @@ int main(int argc, char *argv[])
         // Start measuring time
         start_time = omp_get_wtime();
 
+        float final_mse = 0.0f;
+
         // Training loop — NO malloc/free inside this loop!
         for (int epoch = 0; epoch < EPOCHS; epoch++)
         {
@@ -556,8 +595,7 @@ int main(int argc, char *argv[])
                 mat_mult_into(&g_pool.Z1, W2, &g_pool.Y_pred);
 
                 // Compute loss
-                float loss =
-                    mean_squared_error(&g_pool.Y_pred, &g_pool.Y_batch);
+                final_mse = mean_squared_error(&g_pool.Y_pred, &g_pool.Y_batch);
 
                 // Backward pass (all temporaries use pool matrices)
                 backpropagation(&g_pool.X_batch, &g_pool.Y_batch, &g_pool.Z1,
@@ -568,15 +606,16 @@ int main(int argc, char *argv[])
         // Stop measuring time
         end_time = omp_get_wtime();
         total_time += (end_time - start_time);
+        total_final_mse += final_mse;
 
         // Cleanup weights for this run
         free_matrix(W1);
         free_matrix(W2);
     }
 
-    // Print average training time
-    printf("Average training time over %d runs: %.4f seconds\n", NUM_TEST_RUNS,
-           total_time / NUM_TEST_RUNS);
+    // Print average training time and MSE
+    printf("Average training time over %d runs: %.4f seconds | Average final MSE: %.6f\n", NUM_TEST_RUNS,
+           total_time / NUM_TEST_RUNS, total_final_mse / NUM_TEST_RUNS);
 
     // Cleanup — all at once
     free_matrix(X);
