@@ -327,6 +327,7 @@ int main(int argc, char *argv[]) {
 
   double start_time, end_time;
   double total_time = 0.0;
+  float total_final_mse = 0.0f;
 
   Matrix *X, *Y;
   int num_samples;
@@ -343,6 +344,8 @@ int main(int argc, char *argv[]) {
 
     // Start measuring time
     start_time = omp_get_wtime();
+
+    float final_mse = 0.0f;
 
     // Training loop
     for (int epoch = 0; epoch < EPOCHS; epoch++) {
@@ -362,7 +365,7 @@ int main(int argc, char *argv[]) {
         Matrix *Y_pred = mat_mult(Z1, W2);
 
         // Compute loss
-        float loss = mean_squared_error(Y_pred, Y_batch);
+        final_mse = mean_squared_error(Y_pred, Y_batch);
 
         // Backward pass
         backpropagation(X_batch, Y_batch, Z1, Y_pred, W1, W2, batch_size);
@@ -378,15 +381,16 @@ int main(int argc, char *argv[]) {
     // Stop measuring time
     end_time = omp_get_wtime();
     total_time += (end_time - start_time);
+    total_final_mse += final_mse;
 
     // Cleanup weights for this run
     free_matrix(W1);
     free_matrix(W2);
   }
 
-  // Print average training time
-  printf("Average training time over %d runs: %.4f seconds\n", NUM_TEST_RUNS,
-         total_time / NUM_TEST_RUNS);
+  // Print average training time and MSE
+  printf("Average training time over %d runs: %.4f seconds | Average final MSE: %.6f\n", NUM_TEST_RUNS,
+         total_time / NUM_TEST_RUNS, total_final_mse / NUM_TEST_RUNS);
 
   // Cleanup data
   free_matrix(X);
