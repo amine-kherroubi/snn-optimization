@@ -22,7 +22,7 @@ for FILE in nn_cuda_reference.cu nn_cuda_combined.cu; do
         for DATASET in small medium large; do
             echo "    $DATASET..."
             OUTPUT=$(./test_${HIDDEN} ../reference/data/synthetic_convex_${DATASET}.csv 2>&1)
-            TIME=$(echo "$OUTPUT" | grep "Average training time" | awk '{print $6}')
+            TIME=$(echo "$OUTPUT" | grep "Average training time")
             echo "$NAME,$HIDDEN,$DATASET,$TIME" >> $RESULTS_FILE
         done
         

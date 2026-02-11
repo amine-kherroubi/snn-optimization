@@ -25,7 +25,7 @@ for FILE_INFO in "${FILES[@]}"; do
   for DATASET in small medium large; do
     echo "  $DATASET..."
     OUTPUT=$(./test_network ../reference/data/synthetic_convex_${DATASET}.csv 2>&1)
-    TIME=$(echo "$OUTPUT" | grep "Average training time" | awk '{print $6}')
+    TIME=$(echo "$OUTPUT" | grep "Average training time")
     echo "$NAME,$LAYERS,$DATASET,$TIME" >> $RESULTS_FILE
   done
   
