@@ -28,13 +28,11 @@ typedef struct {
 
 // Global GPU context to avoid repeated allocations
 typedef struct {
-  float *d_B_cache;
   float *d_A_tiles[NUM_STREAMS];
   float *d_C_tiles[NUM_STREAMS];
   cudaStream_t streams[NUM_STREAMS];
   size_t tile_bytes_A;
   size_t tile_bytes_C;
-  size_t cached_B_size;
   int max_A_cols;  // Track max A columns for tile allocation
   int max_B_cols;  // Track max B columns for tile allocation
   int initialized;
@@ -80,7 +78,6 @@ void init_global_gpu_context() {
 
   g_gpu_ctx.tile_bytes_A = 0;
   g_gpu_ctx.tile_bytes_C = 0;
-  g_gpu_ctx.cached_B_size = 0;
   g_gpu_ctx.max_A_cols = 0;
   g_gpu_ctx.max_B_cols = 0;
 
@@ -90,7 +87,6 @@ void init_global_gpu_context() {
     cudaStreamCreate(&g_gpu_ctx.streams[s]);
   }
 
-  g_gpu_ctx.d_B_cache = NULL;
   g_gpu_ctx.initialized = 1;
 }
 
@@ -104,8 +100,6 @@ void cleanup_global_gpu_context() {
     cudaStreamDestroy(g_gpu_ctx.streams[s]);
   }
 
-  if (g_gpu_ctx.d_B_cache)
-    cudaFree(g_gpu_ctx.d_B_cache);
   g_gpu_ctx.initialized = 0;
 }
 
@@ -169,8 +163,6 @@ Matrix *mat_mult(Matrix *A, Matrix *B) {
 
   Matrix *C = allocate_matrix(A->rows, B->cols);
 
-  size_t sizeB = B->rows * B->cols * sizeof(float);
-
   // Initialize GPU context on first call
   if (!g_gpu_ctx.initialized) {
     init_global_gpu_context();
@@ -179,14 +171,11 @@ Matrix *mat_mult(Matrix *A, Matrix *B) {
   // Ensure tile buffers are large enough for this operation
   ensure_tile_capacity(A->cols, B->cols);
 
-  // Reuse or reallocate B cache if size changed
-  if (g_gpu_ctx.cached_B_size != sizeB) {
-    if (g_gpu_ctx.d_B_cache)
-      cudaFree(g_gpu_ctx.d_B_cache);
-    cudaMalloc((void **)&g_gpu_ctx.d_B_cache, sizeB);
-    cudaMemcpy(g_gpu_ctx.d_B_cache, B->data, sizeB, cudaMemcpyHostToDevice);
-    g_gpu_ctx.cached_B_size = sizeB;
-  }
+  // Allocate and copy B for this operation (no caching)
+  float *d_B;
+  size_t sizeB = B->rows * B->cols * sizeof(float);
+  cudaMalloc((void **)&d_B, sizeB);
+  cudaMemcpy(d_B, B->data, sizeB, cudaMemcpyHostToDevice);
 
   // Tile by rows of A/C with triple buffering and async copies
   for (int row_start = 0, tile_idx = 0; row_start < A->rows;
@@ -205,7 +194,7 @@ Matrix *mat_mult(Matrix *A, Matrix *B) {
                    (tile_rows + threadsPerBlock.y - 1) / threadsPerBlock.y);
 
     mat_mult_kernel<<<numBlocks, threadsPerBlock, 0, g_gpu_ctx.streams[s]>>>(
-        g_gpu_ctx.d_A_tiles[s], g_gpu_ctx.d_B_cache, g_gpu_ctx.d_C_tiles[s],
+        g_gpu_ctx.d_A_tiles[s], d_B, g_gpu_ctx.d_C_tiles[s],
         tile_rows, A->cols, B->cols);
 
     float *C_tile_host = C->data + row_start * C->cols;
@@ -218,6 +207,8 @@ Matrix *mat_mult(Matrix *A, Matrix *B) {
   for (int s = 0; s < NUM_STREAMS; s++) {
     cudaStreamSynchronize(g_gpu_ctx.streams[s]);
   }
+
+  cudaFree(d_B);
 
   return C;
 }
@@ -436,7 +427,7 @@ int main(int argc, char *argv[]) {
 
         // Compute loss
         final_mse = mean_squared_error(Y_pred, Y_batch);
-        
+
 
         // Backward pass
         backpropagation(X_batch, Y_batch, Z1, Y_pred, W1, W2, batch_size);
