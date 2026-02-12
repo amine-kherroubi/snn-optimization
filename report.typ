@@ -13,7 +13,7 @@
     #v(0.4em)
   ],
   abstract: [
-    Building upon prior work by Brouthen and Akeb [1] on GPU parallelization for shallow neural network training, we evaluate three memory management strategies for CUDA implementations. Their reference implementation allocates and frees GPU memory for every matrix operation. We implemented three alternatives: a streams-based approach using CUDA streams for concurrent execution, a pinned memory strategy using page-locked host memory, and a combined approach that integrates both optimizations with pre-allocated GPU resources. Our experiments on a Tesla T4 GPU show that the combined strategy achieves approximately 1.65× to 1.73× speedup over the reference implementation for the baseline network configuration, by eliminating repeated `cudaMalloc` and `cudaFree` calls. We validate functional correctness across all strategies and provide additional scalability analysis with varying numbers of neurons and network depths. All code is publicly available at #link("https://github.com/amine-kherroubi/snn-optimization")[github.com/amine-kherroubi/snn-optimization].
+    This project was conducted at the École Nationale Supérieure d'Informatique (ESI), Algiers, in February 2026. Building upon prior work by Brouthen and Akeb [1] on GPU parallelization for shallow neural network training, we evaluate three memory management strategies for CUDA implementations. Their reference implementation allocates and frees GPU memory for every matrix operation. We implemented three alternatives: a streams-based approach using CUDA streams for concurrent execution, a pinned memory strategy using page-locked host memory, and a combined approach that integrates both optimizations with pre-allocated GPU resources. Our experiments on a Tesla T4 GPU show that the combined strategy achieves approximately 1.65× to 1.73× speedup over the reference implementation for the baseline network configuration, by eliminating repeated `cudaMalloc` and `cudaFree` calls. We validate functional correctness across all strategies and provide additional scalability analysis with varying numbers of neurons and network depths. All code is publicly available at #link("https://github.com/amine-kherroubi/snn-optimization")[github.com/amine-kherroubi/snn-optimization].
   ],
   authors: (
     (
@@ -286,11 +286,10 @@ void init_global_gpu_context(int tile_rows, int A_cols, int B_cols) {
   if (g_gpu_ctx.initialized) return;
 
   for (int s = 0; s < NUM_STREAMS; s++) {
-    cudaMalloc((void **)&g_gpu_ctx.d_A_tiles[s], tile_bytes_A);
-    cudaMalloc((void **)&g_gpu_ctx.d_C_tiles[s], tile_bytes_C);
+    cudaMalloc((void **) &g_gpu_ctx.d_A_tiles[s], tile_bytes_A);
+    cudaMalloc((void **) &g_gpu_ctx.d_C_tiles[s], tile_bytes_C);
     cudaStreamCreate(&g_gpu_ctx.streams[s]);
   }
-  g_gpu_ctx.d_B_cache = NULL;
   g_gpu_ctx.initialized = 1;
 }
 ```
@@ -301,6 +300,9 @@ For each operation, the implementation reuses pre-allocated resources:
 Matrix *mat_mult(Matrix *A, Matrix *B) {
   if (!g_gpu_ctx.initialized)
     init_global_gpu_context(TILE_ROWS, A->cols, B->cols);
+
+  // Ensure tile buffers are large enough for this operation
+  ensure_tile_capacity(A->cols, B->cols);
 
   // Tiled loop reuses g_gpu_ctx.d_A_tiles, d_C_tiles, streams
 }
@@ -326,9 +328,6 @@ Host memory uses `cudaMallocHost` (pinned), as in the streams approach.
 Unlike the streams-only approach, this strategy:
 - Allocates GPU tile buffers and streams once at initialization
 - Keeps streams persistent across operations
-- Caches matrix B on the device; the cache is invalidated only when the byte size of B changes
-
-The B cache is keyed by byte size. When consecutive `mat_mult` calls encounter different matrices of the same size, the cache is not refreshed. The distinct matrix sizes encountered during one training iteration differ sufficiently that this does not affect correctness, as confirmed by functional validation.
 
 = Experimental Setup
 
@@ -346,7 +345,7 @@ All experiments used Google Colab with a Tesla T4 GPU:
     [Memory Size], [16 GB GDDR6],
     [Memory Bandwidth], [320 GB/s],
     [Compute Capability], [7.5],
-    [Copy Engines], [1 bidirectional],
+    [Copy Engines], [3],
   ),
 )
 
@@ -442,7 +441,7 @@ We evaluated all three optimization strategies across the small, medium, and lar
 
 == Analysis of Optimization Strategies
 
-*Streams-only approach:* This strategy provided minimal improvement (0.99× to 1.12× speedup). The Tesla T4's single bidirectional copy engine prevents concurrent transfers in both directions, limiting the benefit of asynchronous operations. Additionally, streams and tile device buffers are allocated and freed on each `mat_mult` call, failing to eliminate the allocation overhead.
+*Streams-only approach:* This strategy provided minimal improvement (0.99× to 1.12× speedup) despite the Tesla T4's 3 copy engines. While the hardware supports concurrent transfers, streams and tile device buffers are allocated and freed on each `mat_mult` call, failing to eliminate the allocation overhead. Additionally, for batch size 256 and tile height 128 rows, each matrix produces only two tiles, providing insufficient pipeline depth to effectively utilize the available copy engines and amortize stream setup overhead.
 
 *Pinned memory approach:* This strategy achieved modest but consistent improvements (4–18% speedup) by removing the intermediate staging copy that CUDA performs when transferring pageable memory. The gains are limited because device-side allocation overhead remains unchanged.
 
@@ -454,10 +453,10 @@ Beyond the core optimization strategies, we conducted additional experiments to 
 
 == Neuron Count Variation
 
-We analyzed how the number of neurons in the hidden layer affects the speedup achieved by the combined strategy. These measurements were taken in a separate experimental session from Table 4.
+We analyzed how the number of neurons in the hidden layer affects the speedup achieved by the combined strategy. Note: Due to experimental constraints, these measurements were conducted in a separate session with different baseline performance characteristics than Table 4. While absolute timing values differ between sessions, the relative trends in how neuron count affects optimization effectiveness remain valid.
 
 #figure(
-  caption: [Training Time vs. Neuron Count (large dataset)],
+  caption: [Training Time vs. Neuron Count (large dataset, separate experimental session)],
   table(
     columns: (auto, 1fr, 1fr, 1fr),
     align: (left, right, right, right),
@@ -473,7 +472,9 @@ We analyzed how the number of neurons in the hidden layer affects the speedup ac
   caption: [Speedup of the combined strategy versus neuron count. Performance degrades at 1024 neurons.],
 )
 
-For small networks (128–256 neurons), each matrix multiplication completes quickly, making allocation overhead a significant portion of total runtime. The combined strategy achieves 2.14× to 2.24× speedup. For large networks (1024 neurons), computation time dominates, and the tiling overhead causes the combined strategy to perform 7% worse than the reference.
+For small to moderate network sizes (128–256 neurons), each matrix multiplication completes quickly, making allocation overhead a significant portion of total runtime. The combined strategy achieves substantial speedups by eliminating this overhead. For large networks (1024 neurons), computation time dominates, and the tiling overhead causes the combined strategy to perform worse than the reference (0.93× speedup).
+
+The key finding is that optimization effectiveness depends heavily on the allocation-to-computation ratio: smaller networks benefit more from memory pooling optimizations.
 
 == Network Depth Variation
 
@@ -492,17 +493,19 @@ Each additional hidden layer increases the number of matrix operations per batch
     align: (left, right, right, right),
     [Architecture], [Reference (s)], [Combined (s)], [Speedup],
     [Reference (1 hidden)], [30.3694], [18.4545], [1.65×],
-    [Two-hidden-layer], [Not measured], [Not measured], [-],
+    [Two-hidden-layer], [69.7862], [45.9064], [1.52×],
     [Three-hidden-layer], [285.8243], [282.2075], [1.01×],
   ),
 )
 
 #figure(
   image("network_depth_comparison.png", width: 100%),
-  caption: [Training time comparison across network depths. The combined strategy's advantage diminishes for deeper architectures.],
+  caption: [Training time comparison across network depths. The combined strategy's advantage diminishes progressively as network depth increases.],
 )
 
-For the three-hidden-layer network, the combined strategy achieved only 1.01× speedup. The large intermediate activations of the 1024-neuron second hidden layer dominate execution time. With 11 matrix multiplications per batch instead of 5, computation cost grows faster than the fixed allocation savings, reducing the relative benefit of memory pooling.
+The results show a gradual degradation in speedup as network depth increases. For the two-hidden-layer network, the combined strategy still achieves 1.52× speedup, demonstrating that memory pooling optimizations remain effective for moderately deep networks. However, for the three-hidden-layer network with a large 1024-neuron second hidden layer, speedup drops to 1.01×.
+
+The primary factor is that as network depth increases from 1 to 3 hidden layers, the number of matrix operations per batch grows from 5 to 11. This growth in computational workload, particularly when combined with large intermediate activations (1024 neurons in the second hidden layer), causes computation time to dominate execution. The fixed allocation savings achieved by the combined strategy become negligible relative to the increased computation cost, reducing the relative benefit of memory pooling.
 
 = Discussion
 
@@ -512,13 +515,11 @@ The performance of memory management optimizations is not uniform across configu
 
 For the reference network configuration (256 neurons, 1 hidden layer), the combined strategy achieves 1.65× to 1.73× speedup across dataset sizes. Allocation overhead constitutes a significant portion of total time, and eliminating over 50,000 GPU allocation calls for the large dataset provides measurable benefits.
 
-However, as network size or depth increases, computation time dominates. For 1024 neurons, the combined strategy performs 7% worse than the reference due to tiling overhead. For the three-hidden-layer network, speedup drops to near 1.0× because the large second hidden layer increases computation time relative to the fixed allocation savings.
+However, as network size or depth increases, computation time dominates. For 1024 neurons, the combined strategy performs 7% worse than the reference due to tiling overhead. For deeper architectures, speedup degrades progressively: the two-hidden-layer network maintains 1.52× speedup, while the three-hidden-layer network achieves only 1.01× speedup. The large second hidden layer (1024 neurons) in the three-layer architecture increases computation time relative to the fixed allocation savings, effectively nullifying the optimization benefits.
 
 == Why Streams Alone Did Not Help
 
-The streams strategy provided minimal improvement (0.99× to 1.12×) due to three factors:
-
-*Hardware limitations:* The Tesla T4 has only one bidirectional copy engine. Even with three streams, the GPU cannot transfer data in both directions concurrently, forcing transfers to serialize.
+The streams strategy provided minimal improvement (0.99× to 1.12×) due to two factors:
 
 *Unchanged allocation overhead:* Streams, tile device buffers, and matrix B are allocated and freed on each `mat_mult` call, leaving the primary bottleneck unaddressed.
 
@@ -538,11 +539,11 @@ We evaluated three memory management strategies for GPU-accelerated neural netwo
 
 *Individual strategies:* Streams alone provided minimal benefit (0.99× to 1.12×) due to hardware constraints and unchanged allocation overhead. Pinned memory achieved modest improvements (1.04× to 1.18×) by accelerating transfers.
 
-*Combined strategy:* The combined approach achieved 1.65× to 1.73× speedup on the reference network configuration by eliminating repeated GPU allocation calls. This strategy is most effective when allocation overhead is significant relative to computation time.
+*Combined strategy:* For the reference network configuration (256 neurons, 1 hidden layer), the combined approach achieved 1.65× to 1.73× speedup across different dataset sizes by eliminating repeated GPU allocation calls. Additional experiments showed that speedup ranges from 2.14× for moderate configurations to 0.93× for large configurations (1024 neurons), demonstrating that effectiveness depends critically on the allocation-to-computation ratio.
 
-*Configuration dependence:* Performance gains are not uniform. For the reference network (256 neurons, 1 hidden layer), the combined strategy provides consistent speedups. For larger configurations (1024 neurons or 3 hidden layers), the reference implementation performs equally well or better.
+*Configuration dependence:* Performance gains are highly configuration-dependent. Memory pooling optimizations are most effective when allocation overhead dominates (smaller networks, fewer neurons), but provide minimal or negative benefit when computation dominates (larger networks, more neurons, deeper architectures).
 
-*Practical implications:* The effective range of memory pooling optimizations is bounded by the relative cost of allocation versus computation. Profiling specific configurations is advisable before applying these optimizations.
+*Practical implications:* The effective range of memory pooling optimizations is bounded by the relative cost of allocation versus computation. Profiling specific configurations is essential before applying these optimizations, as benefits observed in one configuration do not reliably transfer to others.
 
 == Future Work
 
