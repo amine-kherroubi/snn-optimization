@@ -13,7 +13,7 @@
     #v(0.4em)
   ],
   abstract: [
-    Building upon prior work by Brouthen and Akeb on GPU parallelization for shallow neural network training, we evaluate three memory management strategies for CUDA implementations. Their reference implementation allocates and frees GPU memory for every matrix operation. We implemented three alternative strategies: a streams-based approach using CUDA streams for concurrent execution, a pinned memory strategy using page-locked host memory, and a combined approach that integrates both optimizations with pre-allocated GPU resources. Our experiments on a Tesla T4 GPU show that the combined strategy achieves approximately 1.65× to 1.73× speedup over the reference implementation for the baseline network configuration, by eliminating repeated `cudaMalloc` and `cudaFree` calls. We validate functional correctness across all strategies and provide additional scalability analysis with varying numbers of neurons and network depths. All code is publicly available at #link("https://github.com/amine-kherroubi/snn-optimization")[github.com/amine-kherroubi/snn-optimization].
+    Building upon prior work by Brouthen and Akeb [1] on GPU parallelization for shallow neural network training, we evaluate three memory management strategies for CUDA implementations. Their reference implementation allocates and frees GPU memory for every matrix operation. We implemented three alternatives: a streams-based approach using CUDA streams for concurrent execution, a pinned memory strategy using page-locked host memory, and a combined approach that integrates both optimizations with pre-allocated GPU resources. Our experiments on a Tesla T4 GPU show that the combined strategy achieves approximately 1.65× to 1.73× speedup over the reference implementation for the baseline network configuration, by eliminating repeated `cudaMalloc` and `cudaFree` calls. We validate functional correctness across all strategies and provide additional scalability analysis with varying numbers of neurons and network depths. All code is publicly available at #link("https://github.com/amine-kherroubi/snn-optimization")[github.com/amine-kherroubi/snn-optimization].
   ],
   authors: (
     (
@@ -58,11 +58,11 @@
 
 == Motivation
 
-Matrix multiplication is the primary computational bottleneck in neural network training, occurring repeatedly during both forward and backward propagation. Brouthen and Akeb (2024) demonstrated that GPU acceleration with CUDA significantly speeds up shallow neural network training compared to CPU implementations.
+Matrix multiplication is the primary computational bottleneck in neural network training, occurring repeatedly during both forward and backward propagation. Brouthen and Akeb [1] demonstrated that GPU acceleration with CUDA significantly speeds up shallow neural network training compared to CPU implementations.
 
 However, their reference implementation allocates and frees GPU memory with `cudaMalloc` and `cudaFree` for each matrix operation. For a typical training run with 100 epochs and multiple batches, this leads to tens of thousands of allocation-deallocation cycles. With a dataset containing 100 batches, the reference network (1 hidden layer) performs 5 matrix multiplications per batch, yielding 50,000 allocation-deallocation pairs over 100 epochs. Additionally, synchronous transfers with pageable host memory via `cudaMemcpy` block the CPU, preventing overlap between computation and data transfers.
 
-== Objectives
+= Objectives
 
 This work evaluates three CUDA memory management strategies applied to the reference network:
 
@@ -70,15 +70,15 @@ This work evaluates three CUDA memory management strategies applied to the refer
 2. *Pinned memory:* Using page-locked host memory to accelerate data transfers
 3. *Combined approach:* Integrating pinned memory and streams with pre-allocated GPU resources
 
-Our goals are to quantify the performance impact of each strategy, validate functional correctness, and understand which optimizations provide meaningful speedups for shallow neural network training.
+Our goals are to quantify the performance impact of each strategy, validate functional correctness, and understand which optimizations provide meaningful speedups for shallow neural network training. In addition, we aim to determine how architectural parameters influence the effectiveness of memory-oriented optimizations.
 
-== Paper Organization
+= Paper Organization
 
 Section 2 reviews the neural network architecture. Section 3 analyzes the reference implementation. Section 4 describes our three optimization strategies. Section 5 details the experimental setup including functional validation. Section 6 presents performance results for the optimization strategies. Section 7 provides additional scalability analysis. Section 8 discusses findings. Section 9 concludes.
 
 = Neural Network Overview
 
-This section briefly reviews the shallow neural network used in our primary experiments. For complete details, refer to Brouthen and Akeb (2024).
+This section briefly reviews the shallow neural network used in our primary experiments. For complete details, refer to Brouthen and Akeb [1].
 
 == Reference Network Architecture
 
@@ -265,18 +265,14 @@ This strategy addresses the core bottleneck by pre-allocating all GPU resources 
 
 ```c
 typedef struct {
-  // Cached device copy of B
-  float *d_B_cache;
-  
   float *d_A_tiles[NUM_STREAMS];
   float *d_C_tiles[NUM_STREAMS];
-  
+
   // Persistent streams
   cudaStream_t streams[NUM_STREAMS];
-  
+
   size_t tile_bytes_A;
   size_t tile_bytes_C;
-  size_t cached_B_size;
   int initialized;
 } GlobalGPUContext;
 
@@ -306,16 +302,6 @@ Matrix *mat_mult(Matrix *A, Matrix *B) {
   if (!g_gpu_ctx.initialized)
     init_global_gpu_context(TILE_ROWS, A->cols, B->cols);
 
-  // Re-upload B only if its byte size changed
-  size_t sizeB = B->rows * B->cols * sizeof(float);
-  if (g_gpu_ctx.cached_B_size != sizeB) {
-    if (g_gpu_ctx.d_B_cache) cudaFree(g_gpu_ctx.d_B_cache);
-    cudaMalloc((void **)&g_gpu_ctx.d_B_cache, sizeB);
-    cudaMemcpy(g_gpu_ctx.d_B_cache, B->data, sizeB,
-               cudaMemcpyHostToDevice);
-    g_gpu_ctx.cached_B_size = sizeB;
-  }
-
   // Tiled loop reuses g_gpu_ctx.d_A_tiles, d_C_tiles, streams
 }
 ```
@@ -329,7 +315,7 @@ void cleanup_global_gpu_context() {
     cudaFree(g_gpu_ctx.d_C_tiles[s]);
     cudaStreamDestroy(g_gpu_ctx.streams[s]);
   }
-  if (g_gpu_ctx.d_B_cache) cudaFree(g_gpu_ctx.d_B_cache);
+  g_gpu_ctx.initialized = 0;
 }
 ```
 
@@ -484,7 +470,7 @@ We analyzed how the number of neurons in the hidden layer affects the speedup ac
 
 #figure(
   image("speedup_vs_neurons.png", width: 90%),
-  caption: [Speedup of the combined strategy versus neuron count. Performance degrades at 1024 neurons.]
+  caption: [Speedup of the combined strategy versus neuron count. Performance degrades at 1024 neurons.],
 )
 
 For small networks (128–256 neurons), each matrix multiplication completes quickly, making allocation overhead a significant portion of total runtime. The combined strategy achieves 2.14× to 2.24× speedup. For large networks (1024 neurons), computation time dominates, and the tiling overhead causes the combined strategy to perform 7% worse than the reference.
@@ -513,7 +499,7 @@ Each additional hidden layer increases the number of matrix operations per batch
 
 #figure(
   image("network_depth_comparison.png", width: 100%),
-  caption: [Training time comparison across network depths. The combined strategy's advantage diminishes for deeper architectures.]
+  caption: [Training time comparison across network depths. The combined strategy's advantage diminishes for deeper architectures.],
 )
 
 For the three-hidden-layer network, the combined strategy achieved only 1.01× speedup. The large intermediate activations of the 1024-neuron second hidden layer dominate execution time. With 11 matrix multiplications per batch instead of 5, computation cost grows faster than the fixed allocation savings, reducing the relative benefit of memory pooling.
@@ -564,7 +550,7 @@ Future work could explore shared memory tiling and tensor core operations to red
 
 = Acknowledgments
 
-This work builds upon the research by Brouthen Kamel and Akeb Abdelaziz (2024), whose baseline CUDA implementation and thorough documentation enabled our investigation.
+This work builds upon the research by Brouthen Kamel and Akeb Abdelaziz, whose baseline CUDA implementation and thorough documentation enabled our investigation.
 
 We thank Professor Dr. Amina Selma Haichour, our High Performance Computing instructor, for her guidance throughout this project.
 

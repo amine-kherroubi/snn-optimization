@@ -24,6 +24,13 @@ int main() {
       printf("  Total global memory: %lu mega bytes\n",
              deviceProp.totalGlobalMem / 1024 / 1024);
       printf("  Multiprocessor count: %d\n", deviceProp.multiProcessorCount);
+
+      printf("  Async copy engines: %d\n", deviceProp.asyncEngineCount);
+      printf("  Device overlap (copy/compute overlap): %s\n",
+             deviceProp.deviceOverlap ? "Yes" : "No");
+      printf("  Concurrent kernels support: %s\n",
+             deviceProp.concurrentKernels ? "Yes" : "No");
+
       printf("  Max threads per block: %d\n", deviceProp.maxThreadsPerBlock);
       printf("  Max threads dimensions: %d x %d x %d\n",
              deviceProp.maxThreadsDim[0], deviceProp.maxThreadsDim[1],
