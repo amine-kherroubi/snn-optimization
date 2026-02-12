@@ -49,12 +49,15 @@ void free_matrix(Matrix *m)
 // Function to initialize matrix with random values using He initialization
 void random_init(Matrix *m)
 {
+    // He initialization: scale by sqrt(2/n_in) for ReLU networks
+    float scale = sqrtf(2.0f / m->rows);
     for (int i = 0; i < m->rows; i++)
     {
         for (int j = 0; j < m->cols; j++)
         {
-            // Initialize with random values between 0 and 1
-            m->data[i * m->cols + j] = (float)rand() / RAND_MAX;
+            // Generate random value in range [-1, 1] then scale
+            float rand_val = 2.0f * ((float)rand() / RAND_MAX) - 1.0f;
+            m->data[i * m->cols + j] = rand_val * scale;
         }
     }
 }
@@ -190,9 +193,35 @@ float mean_squared_error(Matrix *Y_pred, Matrix *Y_true)
 }
 
 // ! Optimization
+// Function to clip gradients to prevent explosions
+void clip_gradients(Matrix *grad, float max_norm)
+{
+    float norm = 0.0f;
+    
+    // Compute gradient norm
+    for (int i = 0; i < grad->rows * grad->cols; i++)
+    {
+        norm += grad->data[i] * grad->data[i];
+    }
+    norm = sqrtf(norm);
+    
+    // Clip if necessary
+    if (norm > max_norm)
+    {
+        float scale = max_norm / (norm + 1e-6f);
+        for (int i = 0; i < grad->rows * grad->cols; i++)
+        {
+            grad->data[i] *= scale;
+        }
+    }
+}
+
 // Function to update weights: W = W - learning_rate * grad
 void update_weights(Matrix *W, Matrix *grad, float learning_rate)
 {
+    // Clip gradients before updating (more aggressive for deeper network)
+    clip_gradients(grad, 3.0f);
+    
     for (int i = 0; i < W->rows; i++)
         for (int j = 0; j < W->cols; j++)
             W->data[i * W->cols + j] -=
@@ -414,6 +443,7 @@ int main(int argc, char *argv[])
 
     double start_time, end_time;
     double total_time = 0.0;
+    float total_final_mse = 0.0f;
 
     Matrix *X, *Y;
     int num_samples;
@@ -435,6 +465,8 @@ int main(int argc, char *argv[])
 
         // Start measuring time
         start_time = omp_get_wtime();
+
+        float final_mse = 0.0f;
 
         // Training loop
         for (int epoch = 0; epoch < EPOCHS; epoch++)
@@ -461,7 +493,7 @@ int main(int argc, char *argv[])
                 Matrix *Y_pred = mat_mult(Z3, W4);
 
                 // Compute loss
-                float loss = mean_squared_error(Y_pred, Y_batch);
+                final_mse = mean_squared_error(Y_pred, Y_batch);
 
                 // Backward pass
                 backpropagation(X_batch, Y_batch, Z1, Z2, Z3, Y_pred, W1, W2, W3, W4,
@@ -480,6 +512,7 @@ int main(int argc, char *argv[])
         // Stop measuring time
         end_time = omp_get_wtime();
         total_time += (end_time - start_time);
+        total_final_mse += final_mse;
 
         // Cleanup weights for this run
         free_matrix(W1);
@@ -488,9 +521,9 @@ int main(int argc, char *argv[])
         free_matrix(W4);
     }
 
-    // Print average training time
-    printf("Average training time over %d runs: %.4f seconds\n", NUM_TEST_RUNS,
-           total_time / NUM_TEST_RUNS);
+    // Print average training time and MSE
+    printf("Average training time over %d runs: %.4f seconds | Average final MSE: %.6f\n", NUM_TEST_RUNS,
+           total_time / NUM_TEST_RUNS, total_final_mse / NUM_TEST_RUNS);
 
     // Cleanup data
     free_matrix(X);
