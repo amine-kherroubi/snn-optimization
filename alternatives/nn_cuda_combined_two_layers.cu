@@ -31,35 +31,74 @@ typedef struct
 // Global GPU context to avoid repeated allocations
 typedef struct
 {
-    float *d_B_cache;
     float *d_A_tiles[NUM_STREAMS];
     float *d_C_tiles[NUM_STREAMS];
     cudaStream_t streams[NUM_STREAMS];
     size_t tile_bytes_A;
     size_t tile_bytes_C;
-    size_t cached_B_size;
+    int max_A_cols;  // Track max A columns for tile allocation
+    int max_B_cols;  // Track max B columns for tile allocation
     int initialized;
 } GlobalGPUContext;
 
 static GlobalGPUContext g_gpu_ctx = {0};
 
-void init_global_gpu_context(int tile_rows, int A_cols, int B_cols)
+void ensure_tile_capacity(int A_cols, int B_cols)
+{
+    size_t required_A = TILE_ROWS * A_cols * sizeof(float);
+    size_t required_C = TILE_ROWS * B_cols * sizeof(float);
+
+    int needs_realloc = 0;
+
+    // Check if we need larger A tiles
+    if (required_A > g_gpu_ctx.tile_bytes_A)
+    {
+        g_gpu_ctx.tile_bytes_A = required_A;
+        g_gpu_ctx.max_A_cols = A_cols;
+        needs_realloc = 1;
+    }
+
+    // Check if we need larger C tiles
+    if (required_C > g_gpu_ctx.tile_bytes_C)
+    {
+        g_gpu_ctx.tile_bytes_C = required_C;
+        g_gpu_ctx.max_B_cols = B_cols;
+        needs_realloc = 1;
+    }
+
+    if (needs_realloc)
+    {
+        // Reallocate tiles for all streams
+        for (int s = 0; s < NUM_STREAMS; s++)
+        {
+            if (g_gpu_ctx.d_A_tiles[s])
+                cudaFree(g_gpu_ctx.d_A_tiles[s]);
+            if (g_gpu_ctx.d_C_tiles[s])
+                cudaFree(g_gpu_ctx.d_C_tiles[s]);
+
+            cudaMalloc((void **)&g_gpu_ctx.d_A_tiles[s], g_gpu_ctx.tile_bytes_A);
+            cudaMalloc((void **)&g_gpu_ctx.d_C_tiles[s], g_gpu_ctx.tile_bytes_C);
+        }
+    }
+}
+
+void init_global_gpu_context()
 {
     if (g_gpu_ctx.initialized)
         return;
 
-    g_gpu_ctx.tile_bytes_A = tile_rows * A_cols * sizeof(float);
-    g_gpu_ctx.tile_bytes_C = tile_rows * B_cols * sizeof(float);
-    g_gpu_ctx.cached_B_size = 0;
+    g_gpu_ctx.tile_bytes_A = 0;
+    g_gpu_ctx.tile_bytes_C = 0;
+    g_gpu_ctx.max_A_cols = 0;
+    g_gpu_ctx.max_B_cols = 0;
 
     for (int s = 0; s < NUM_STREAMS; s++)
     {
-        cudaMalloc((void **)&g_gpu_ctx.d_A_tiles[s], g_gpu_ctx.tile_bytes_A);
-        cudaMalloc((void **)&g_gpu_ctx.d_C_tiles[s], g_gpu_ctx.tile_bytes_C);
+        g_gpu_ctx.d_A_tiles[s] = NULL;
+        g_gpu_ctx.d_C_tiles[s] = NULL;
         cudaStreamCreate(&g_gpu_ctx.streams[s]);
     }
 
-    g_gpu_ctx.d_B_cache = NULL;
     g_gpu_ctx.initialized = 1;
 }
 
@@ -70,13 +109,11 @@ void cleanup_global_gpu_context()
 
     for (int s = 0; s < NUM_STREAMS; s++)
     {
-        cudaFree(g_gpu_ctx.d_A_tiles[s]);
-        cudaFree(g_gpu_ctx.d_C_tiles[s]);
+        if (g_gpu_ctx.d_A_tiles[s]) cudaFree(g_gpu_ctx.d_A_tiles[s]);
+        if (g_gpu_ctx.d_C_tiles[s]) cudaFree(g_gpu_ctx.d_C_tiles[s]);
         cudaStreamDestroy(g_gpu_ctx.streams[s]);
     }
 
-    if (g_gpu_ctx.d_B_cache)
-        cudaFree(g_gpu_ctx.d_B_cache);
     g_gpu_ctx.initialized = 0;
 }
 
@@ -112,12 +149,15 @@ void free_matrix(Matrix *m)
 // Function to initialize matrix with random values using He initialization
 void random_init(Matrix *m)
 {
+    // He initialization: scale by sqrt(2/n_in) for ReLU networks
+    float scale = sqrtf(2.0f / m->rows);
     for (int i = 0; i < m->rows; i++)
     {
         for (int j = 0; j < m->cols; j++)
         {
-            // Initialize with random values between 0 and 1
-            m->data[i * m->cols + j] = (float)rand() / RAND_MAX;
+            // Generate random value in range [-1, 1] then scale
+            float rand_val = 2.0f * ((float)rand() / RAND_MAX) - 1.0f;
+            m->data[i * m->cols + j] = rand_val * scale;
         }
     }
 }
@@ -151,23 +191,20 @@ Matrix *mat_mult(Matrix *A, Matrix *B)
 
     Matrix *C = allocate_matrix(A->rows, B->cols);
 
-    size_t sizeB = B->rows * B->cols * sizeof(float);
-
     // Initialize GPU context on first call
     if (!g_gpu_ctx.initialized)
     {
-        init_global_gpu_context(TILE_ROWS, A->cols, B->cols);
+        init_global_gpu_context();
     }
 
-    // Reuse or reallocate B cache if size changed
-    if (g_gpu_ctx.cached_B_size != sizeB)
-    {
-        if (g_gpu_ctx.d_B_cache)
-            cudaFree(g_gpu_ctx.d_B_cache);
-        cudaMalloc((void **)&g_gpu_ctx.d_B_cache, sizeB);
-        cudaMemcpy(g_gpu_ctx.d_B_cache, B->data, sizeB, cudaMemcpyHostToDevice);
-        g_gpu_ctx.cached_B_size = sizeB;
-    }
+    // Ensure tile buffers are large enough for this operation
+    ensure_tile_capacity(A->cols, B->cols);
+
+    // Allocate and copy B for this operation (no caching - prevents stale data bugs)
+    float *d_B;
+    size_t sizeB = B->rows * B->cols * sizeof(float);
+    cudaMalloc((void **)&d_B, sizeB);
+    cudaMemcpy(d_B, B->data, sizeB, cudaMemcpyHostToDevice);
 
     // Tile by rows of A/C with triple buffering and async copies
     for (int row_start = 0, tile_idx = 0; row_start < A->rows;
@@ -187,7 +224,7 @@ Matrix *mat_mult(Matrix *A, Matrix *B)
                        (tile_rows + threadsPerBlock.y - 1) / threadsPerBlock.y);
 
         mat_mult_kernel<<<numBlocks, threadsPerBlock, 0, g_gpu_ctx.streams[s]>>>(
-            g_gpu_ctx.d_A_tiles[s], g_gpu_ctx.d_B_cache, g_gpu_ctx.d_C_tiles[s],
+            g_gpu_ctx.d_A_tiles[s], d_B, g_gpu_ctx.d_C_tiles[s],
             tile_rows, A->cols, B->cols);
 
         float *C_tile_host = C->data + row_start * C->cols;
@@ -201,6 +238,8 @@ Matrix *mat_mult(Matrix *A, Matrix *B)
     {
         cudaStreamSynchronize(g_gpu_ctx.streams[s]);
     }
+
+    cudaFree(d_B);
 
     return C;
 }
@@ -263,9 +302,35 @@ float mean_squared_error(Matrix *Y_pred, Matrix *Y_true)
 }
 
 // ! Optimization
+// Function to clip gradients to prevent explosions
+void clip_gradients(Matrix *grad, float max_norm)
+{
+    float norm = 0.0f;
+
+    // Compute gradient norm
+    for (int i = 0; i < grad->rows * grad->cols; i++)
+    {
+        norm += grad->data[i] * grad->data[i];
+    }
+    norm = sqrtf(norm);
+
+    // Clip if necessary
+    if (norm > max_norm)
+    {
+        float scale = max_norm / (norm + 1e-6f);
+        for (int i = 0; i < grad->rows * grad->cols; i++)
+        {
+            grad->data[i] *= scale;
+        }
+    }
+}
+
 // Function to update weights: W = W - learning_rate * grad
 void update_weights(Matrix *W, Matrix *grad, float learning_rate)
 {
+    // Clip gradients before updating
+    clip_gradients(grad, 5.0f);
+
     for (int i = 0; i < W->rows; i++)
         for (int j = 0; j < W->cols; j++)
             W->data[i * W->cols + j] -=
@@ -447,6 +512,7 @@ int main(int argc, char *argv[])
 
     double start_time, end_time;
     double total_time = 0.0;
+    float total_final_mse = 0.0f;
 
     Matrix *X, *Y;
     int num_samples;
@@ -466,6 +532,8 @@ int main(int argc, char *argv[])
 
         // Start measuring time
         start_time = omp_get_wtime();
+
+        float final_mse = 0.0f;
 
         // Training loop
         for (int epoch = 0; epoch < EPOCHS; epoch++)
@@ -490,7 +558,7 @@ int main(int argc, char *argv[])
                 Matrix *Y_pred = mat_mult(Z2, W3);
 
                 // Compute loss
-                float loss = mean_squared_error(Y_pred, Y_batch);
+                final_mse = mean_squared_error(Y_pred, Y_batch);
 
                 // Backward pass
                 backpropagation(X_batch, Y_batch, Z1, Z2, Y_pred, W1, W2, W3,
@@ -508,6 +576,7 @@ int main(int argc, char *argv[])
         // Stop measuring time
         end_time = omp_get_wtime();
         total_time += (end_time - start_time);
+        total_final_mse += final_mse;
 
         // Cleanup weights for this run
         free_matrix(W1);
@@ -515,9 +584,9 @@ int main(int argc, char *argv[])
         free_matrix(W3);
     }
 
-    // Print average training time
-    printf("Average training time over %d runs: %.4f seconds\n", NUM_TEST_RUNS,
-           total_time / NUM_TEST_RUNS);
+    // Print average training time and MSE
+    printf("Average training time over %d runs: %.4f seconds | Average final MSE: %.6f\n", NUM_TEST_RUNS,
+           total_time / NUM_TEST_RUNS, total_final_mse / NUM_TEST_RUNS);
 
     // Cleanup data
     free_matrix(X);
