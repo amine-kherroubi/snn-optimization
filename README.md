@@ -1,68 +1,164 @@
-# Memory Management Strategies for GPU-Accelerated Shallow Neural Network Training
+# GPU Memory Management for Shallow Neural Network Training
 
-This project evaluates memory management optimizations for CUDA-based shallow neural network training, conducted at the École Nationale Supérieure d'Informatique (ESI), Algiers, in January 2026. Building upon the reference implementation by Brouthen and Akeb [1], we investigate three optimization strategies that address GPU memory allocation overhead and transfer efficiency.
+A complete CUDA research case study on memory management optimizations for a shallow neural network. This repository compares a reference GPU implementation against optimized variants that reduce allocation overhead, improve memory transfer, and use CUDA streams.
 
-## Overview
+## 1. What is this project?
 
-The reference implementation allocates and frees GPU memory for every matrix operation, leading to tens of thousands of allocation-deallocation cycles during training. We implement and evaluate three alternatives: a streams-based approach using CUDA streams for concurrent execution, a pinned memory strategy using page-locked host memory, and a combined approach integrating both optimizations with pre-allocated GPU resources. Experiments on a Tesla T4 GPU demonstrate that the combined strategy achieves approximately 1.65× to 1.73× speedup over the reference implementation for the baseline network configuration (256 neurons, 1 hidden layer). Additional scalability analysis reveals that optimization effectiveness is highly configuration-dependent, with benefits diminishing for larger networks (1024 neurons) and deeper architectures (3 hidden layers).
+1. A performance study of memory management in CUDA-based shallow neural network training.
+2. A comparison between a reference GPU implementation and three optimization strategies:
+   - **Streams** — concurrent kernel and transfer execution using CUDA streams.
+   - **Pinned memory** — page-locked host buffers for faster host-device transfers.
+   - **Combined** — both streams and pinned memory with pre-allocated GPU buffers.
+3. Experimental evaluation of scaling behavior across dataset sizes and network depth.
+4. Educational deliverables for a CUDA research project at École Nationale Supérieure d'Informatique (ESI).
 
-## Key Results
+## 2. Why this matters
 
-For the baseline network configuration across three dataset sizes, the combined strategy consistently outperforms the reference implementation (1.65× to 1.73× speedup), while streams alone provide minimal improvement (0.99× to 1.12×) and pinned memory yields modest gains (1.04× to 1.18×). Scalability experiments show that speedup varies from 2.14× for moderate configurations (128 neurons) to 0.93× for large configurations (1024 neurons), demonstrating that memory pooling optimizations are most effective when allocation overhead dominates relative to computation time. Network depth analysis reveals progressive degradation: two hidden layers maintain 1.52× speedup, while three hidden layers achieve only 1.01× speedup due to increased computational workload.
+GPU memory management is often the hidden bottleneck in neural network training. When device allocations and host transfers are repeated for every matrix operation, the overhead can dominate runtime. This project shows how alternative memory strategies can substantially improve performance for shallow network training while preserving correctness.
 
-## Requirements
+## 3. Key technical facts
 
-- CUDA Toolkit 11.8 or later
-- GCC 9.4.0 or compatible host compiler
-- NVIDIA GPU with compute capability 7.5 or higher (tested on Tesla T4)
-- OpenMP for timing (`-fopenmp`)
+- Input dimension: **32 features**
+- Hidden layer size: **256 neurons**
+- Output dimension: **1 neuron**
+- Training epochs: **100**
+- Batch size: **256**
+- Metrics: **average runtime** and **final MSE** over multiple runs
+- Data: synthetic convex datasets in `reference/data/`
+- GPU test target: **NVIDIA T4** with compute capability **7.5**
 
-## Building
+## 4. Requirements
 
-Compile any implementation variant with:
+### Hardware
+- NVIDIA GPU with compute capability **7.5+**
+
+### Software
+- CUDA Toolkit **11.8+**
+- GNU GCC **9.4+**
+- `nvcc` available in `PATH`
+- Python **3.10+** for optional analysis scripts
+- `python3 -m venv` support
+
+### Optional Python packages
+- `numpy`
+- `pandas`
+- `matplotlib`
+
+Install optional Python dependencies with:
 ```bash
-nvcc -O3 -Xcompiler -fopenmp <filename>.cu -o <output_name>
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r python_requirements.txt
 ```
 
-For example:
+## 5. Install and build
+
+### 5.1 Clone the repository
+
 ```bash
-nvcc -O3 -Xcompiler -fopenmp alternatives/nn_cuda_combined.cu -o nn_cuda_combined
+git clone <repo-url>
+cd <repo-name>
 ```
 
-## Usage
+### 5.2 Build the reference implementations
 
-Run training with a synthetic dataset:
 ```bash
-./<executable> <dataset.csv>
+cd reference
+
+gcc -O3 -o nn nn.c -lm -fopenmp
+
+gcc -O3 -o nn_pthreads nn_pthreads.c -lm -pthread -fopenmp
+
+nvcc -O3 -o nn_cuda nn_cuda.cu -Xcompiler -fopenmp -gencode arch=compute_75,code=sm_75
 ```
 
-Example:
+### 5.3 Build the optimized CUDA variants
+
+From the repository root:
+
 ```bash
-./nn_cuda_combined reference/data/synthetic_convex_large.csv
+cd alternatives
+./run_all.sh
 ```
 
-The program outputs average training time and final MSE over 10 independent runs.
+This script compiles the main CUDA variants and runs each of them on the three synthetic datasets.
 
-## Repository Structure
+### 5.4 Build a single optimized variant manually
 
-- `alternatives/` — Optimized CUDA implementations
-  - `nn_cuda_reference.cu` — Baseline reference implementation
-  - `nn_cuda_streams.cu` — Streams-based optimization
-  - `nn_cuda_pinned.cu` — Pinned memory optimization
-  - `nn_cuda_combined.cu` — Combined optimization strategy
-  - `nn_cuda_*_two_layers.cu` / `nn_cuda_*_three_layers.cu` — Network depth variants
-- `reference/data/` — Synthetic convex datasets (small, medium, large)
-- `report/` — Technical report (Typst source and figures)
+```bash
+cd alternatives
+nvcc -O3 -Xcompiler -fopenmp -gencode arch=compute_75,code=sm_75 nn_cuda_combined.cu -o nn_cuda_combined
+```
 
-## Authors
+## 6. Run the code
+
+### 6.1 Run the CUDA baseline
+
+From `reference/`:
+
+```bash
+./nn_cuda ../reference/data/synthetic_convex_small.csv
+```
+
+### 6.2 Run a combined optimization variant
+
+From `alternatives/`:
+
+```bash
+./nn_cuda_combined ../reference/data/synthetic_convex_small.csv
+```
+
+### 6.3 Run the sequential and pthread versions
+
+From `reference/`:
+
+```bash
+./nn ../reference/data/synthetic_convex_small.csv
+./nn_pthreads ../reference/data/synthetic_convex_small.csv
+```
+
+### 6.4 Run all variants automatically
+
+```bash
+cd alternatives
+./run_all.sh
+```
+
+This command:
+1. compiles `nn_cuda_reference`, `nn_cuda_streams`, `nn_cuda_pinned`, and `nn_cuda_combined`
+2. runs each on `small`, `medium`, and `large`
+3. prints timing output for each dataset
+
+## 7. Directory structure
+
+1. `alternatives/`
+   - Optimized CUDA implementations and evaluation scripts.
+   - Variants include `nn_cuda_reference.cu`, `nn_cuda_streams.cu`, `nn_cuda_pinned.cu`, and `nn_cuda_combined.cu`.
+   - Depth variants: `*_two_layers.cu`, `*_three_layers.cu`.
+2. `reference/`
+   - Baseline code and datasets.
+   - `nn.c`, `nn_pthreads.c`, `nn_cuda.cu`, `test_cuda.cu`.
+   - `data/` contains `synthetic_convex_small.csv`, `synthetic_convex_medium.csv`, and `synthetic_convex_large.csv`.
+3. `report/`
+   - Final article source and report materials.
+4. `full_project.ipynb`
+   - Notebook for analysis and visualization.
+5. `python_requirements.txt`
+   - Python dependencies for optional analysis.
+
+## 8. Experimental findings
+
+- The **combined** strategy is the best-performing optimization in this study.
+- **Streams-only** offers small improvements when compute and transfer overlap is already limited.
+- **Pinned memory** improves transfer throughput and reduces host-device overhead.
+- Performance gains depend strongly on network size, batch count, and layer depth.
+- Depth variants show that adding more hidden layers reduces the benefit of memory-only optimizations.
+
+## 9. Authors
 
 Mohamed El Amine Kherroubi, Badis Khalef, Mounir Sofiane Mostefai, Youcef Tati, Mohamed Ishak Messadia
 2CS-SIQ/SID, École Nationale Supérieure d'Informatique (ESI), Algiers
 
-## Acknowledgments
-
-This work builds upon the baseline CUDA implementation by Brouthen Kamel and Akeb Abdelaziz [1]. We thank Professor Dr. Amina Selma Haichour for her guidance throughout this project.
-
-## References
+## 10. Reference
 
 [1] Brouthen, K., & Akeb, A. (2024). Exploring parallelization of shallow neural network using CUDA.
