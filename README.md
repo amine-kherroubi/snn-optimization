@@ -108,7 +108,7 @@ From `reference/`:
 ./nn_cuda ../reference/data/synthetic_convex_small.csv
 ```
 
-### 6.2 Run a combined optimization variant
+### 7.2 Run a combined optimization variant
 
 From `alternatives/`:
 
@@ -116,7 +116,7 @@ From `alternatives/`:
 ./nn_cuda_combined ../reference/data/synthetic_convex_small.csv
 ```
 
-### 6.3 Run the sequential and pthread versions
+### 7.3 Run the sequential and pthread versions
 
 From `reference/`:
 
@@ -125,7 +125,7 @@ From `reference/`:
 ./nn_pthreads ../reference/data/synthetic_convex_small.csv
 ```
 
-### 6.4 Run all variants automatically
+### 7.4 Run all variants automatically
 
 ```bash
 cd alternatives
@@ -137,7 +137,7 @@ This command:
 2. runs each on `small`, `medium`, and `large`
 3. prints timing output for each dataset
 
-## 7. Directory structure
+## 8. Directory structure
 
 1. `alternatives/`
    - Optimized CUDA implementations and evaluation scripts.
@@ -154,7 +154,7 @@ This command:
 5. `python_requirements.txt`
    - Python dependencies for optional analysis.
 
-## 8. Experimental findings
+## 9. Experimental findings
 
 - The **combined** strategy is the best-performing optimization in this study.
 - **Streams-only** offers small improvements when compute and transfer overlap is already limited.
