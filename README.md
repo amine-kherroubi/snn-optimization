@@ -14,11 +14,17 @@ A complete CUDA research case study on memory management optimizations for a sha
 3. Experimental evaluation of scaling behavior across dataset sizes and network depth.
 4. Educational deliverables for a CUDA research project at École Nationale Supérieure d'Informatique (ESI).
 
-## 2. Why this matters
+## 2. Documents
+
+- [Project Specification](project_specification[FRENCH].pdf) - Original project requirements and guidelines in French.
+- [Final Report](project_report[ENGLISH].pdf) - Complete research article with experimental results and analysis.
+- [Reference Report](reference/report/reference_report[ENGLISH].pdf) - Baseline implementation and report by Brouthen and Akeb.
+
+## 3. Why this matters
 
 GPU memory management is often the hidden bottleneck in neural network training. When device allocations and host transfers are repeated for every matrix operation, the overhead can dominate runtime. This project shows how alternative memory strategies can substantially improve performance for shallow network training while preserving correctness.
 
-## 3. Key technical facts
+## 4. Key technical facts
 
 - Input dimension: **32 features**
 - Hidden layer size: **256 neurons**
@@ -29,7 +35,7 @@ GPU memory management is often the hidden bottleneck in neural network training.
 - Data: synthetic convex datasets in `reference/data/`
 - GPU test target: **NVIDIA T4** with compute capability **7.5**
 
-## 4. Requirements
+## 5. Requirements
 
 ### Hardware
 - NVIDIA GPU with compute capability **7.5+**
@@ -53,16 +59,16 @@ source .venv/bin/activate
 pip install -r python_requirements.txt
 ```
 
-## 5. Install and build
+## 6. Install and build
 
-### 5.1 Clone the repository
+### 6.1 Clone the repository
 
 ```bash
 git clone <repo-url>
 cd <repo-name>
 ```
 
-### 5.2 Build the reference implementations
+### 6.2 Build the reference implementations
 
 ```bash
 cd reference
@@ -74,7 +80,7 @@ gcc -O3 -o nn_pthreads nn_pthreads.c -lm -pthread -fopenmp
 nvcc -O3 -o nn_cuda nn_cuda.cu -Xcompiler -fopenmp -gencode arch=compute_75,code=sm_75
 ```
 
-### 5.3 Build the optimized CUDA variants
+### 6.3 Build the optimized CUDA variants
 
 From the repository root:
 
@@ -85,16 +91,16 @@ cd alternatives
 
 This script compiles the main CUDA variants and runs each of them on the three synthetic datasets.
 
-### 5.4 Build a single optimized variant manually
+### 6.4 Build a single optimized variant manually
 
 ```bash
 cd alternatives
 nvcc -O3 -Xcompiler -fopenmp -gencode arch=compute_75,code=sm_75 nn_cuda_combined.cu -o nn_cuda_combined
 ```
 
-## 6. Run the code
+## 7. Run the code
 
-### 6.1 Run the CUDA baseline
+### 7.1 Run the CUDA baseline
 
 From `reference/`:
 
@@ -156,11 +162,11 @@ This command:
 - Performance gains depend strongly on network size, batch count, and layer depth.
 - Depth variants show that adding more hidden layers reduces the benefit of memory-only optimizations.
 
-## 9. Authors
+## 10. Authors
 
 Mohamed El Amine Kherroubi, Badis Khalef, Mounir Sofiane Mostefai, Youcef Tati, Mohamed Ishak Messadia
 2CS-SIQ/SID, École Nationale Supérieure d'Informatique (ESI), Algiers
 
-## 10. References
+## 11. References
 
 [1] Brouthen, K., & Akeb, A. (2024). Exploring parallelization of shallow neural network using CUDA.
