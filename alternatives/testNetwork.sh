@@ -18,17 +18,17 @@ FILES=(
 for FILE_INFO in "${FILES[@]}"; do
   IFS=':' read -r FILE NAME LAYERS <<< "$FILE_INFO"
   echo "Testing $FILE ($LAYERS hidden layers)..."
-  
+
   # Compile
   nvcc -O3 -Xcompiler -fopenmp "$FILE" -o "test_network" 2>/dev/null || continue
-  
+
   for DATASET in small medium large; do
     echo "  $DATASET..."
     OUTPUT=$(./test_network ../reference/data/synthetic_convex_${DATASET}.csv 2>&1)
     TIME=$(echo "$OUTPUT" | grep "Average training time")
     echo "$NAME,$LAYERS,$DATASET,$TIME" >> $RESULTS_FILE
   done
-  
+
   rm -f test_network
 done
 

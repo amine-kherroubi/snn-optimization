@@ -6,7 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-// ! Network Parameters
+// --- Network Parameters
 #define INPUT_SIZE 32      // Number of input features
 #define HIDDEN_SIZE_1 256  // Number of neurons in the first hidden layer
 #define HIDDEN_SIZE_2 1024 // Number of neurons in the second hidden layer
@@ -20,626 +20,560 @@
 #define NUM_STREAMS 3
 #define TILE_ROWS 128
 
-// ! Data Structures
-typedef struct
-{
-    int rows;
-    int cols;
-    float *data;
-    int pinned;
+// --- Data Structures
+typedef struct {
+  int rows;
+  int cols;
+  float *data;
+  int pinned;
 } Matrix;
 
 // Global GPU context to avoid repeated allocations
-typedef struct
-{
-    float *d_A_tiles[NUM_STREAMS];
-    float *d_C_tiles[NUM_STREAMS];
-    cudaStream_t streams[NUM_STREAMS];
-    size_t tile_bytes_A;
-    size_t tile_bytes_C;
-    int max_A_cols;  // Track max A columns for tile allocation
-    int max_B_cols;  // Track max B columns for tile allocation
-    int initialized;
+typedef struct {
+  float *d_A_tiles[NUM_STREAMS];
+  float *d_C_tiles[NUM_STREAMS];
+  cudaStream_t streams[NUM_STREAMS];
+  size_t tile_bytes_A;
+  size_t tile_bytes_C;
+  int max_A_cols; // Track max A columns for tile allocation
+  int max_B_cols; // Track max B columns for tile allocation
+  int initialized;
 } GlobalGPUContext;
 
-static GlobalGPUContext g_gpu_ctx = {0};
+static GlobalGPUContext g_gpu_ctx;
 
-void ensure_tile_capacity(int A_cols, int B_cols)
-{
-    size_t required_A = TILE_ROWS * A_cols * sizeof(float);
-    size_t required_C = TILE_ROWS * B_cols * sizeof(float);
+void ensure_tile_capacity(int A_cols, int B_cols) {
+  size_t required_A = TILE_ROWS * A_cols * sizeof(float);
+  size_t required_C = TILE_ROWS * B_cols * sizeof(float);
 
-    int needs_realloc = 0;
+  int needs_realloc = 0;
 
-    // Check if we need larger A tiles
-    if (required_A > g_gpu_ctx.tile_bytes_A)
-    {
-        g_gpu_ctx.tile_bytes_A = required_A;
-        g_gpu_ctx.max_A_cols = A_cols;
-        needs_realloc = 1;
+  // Check if we need larger A tiles
+  if (required_A > g_gpu_ctx.tile_bytes_A) {
+    g_gpu_ctx.tile_bytes_A = required_A;
+    g_gpu_ctx.max_A_cols = A_cols;
+    needs_realloc = 1;
+  }
+
+  // Check if we need larger C tiles
+  if (required_C > g_gpu_ctx.tile_bytes_C) {
+    g_gpu_ctx.tile_bytes_C = required_C;
+    g_gpu_ctx.max_B_cols = B_cols;
+    needs_realloc = 1;
+  }
+
+  if (needs_realloc) {
+    // Reallocate tiles for all streams
+    for (int s = 0; s < NUM_STREAMS; s++) {
+      if (g_gpu_ctx.d_A_tiles[s])
+        cudaFree(g_gpu_ctx.d_A_tiles[s]);
+      if (g_gpu_ctx.d_C_tiles[s])
+        cudaFree(g_gpu_ctx.d_C_tiles[s]);
+
+      cudaMalloc((void **)&g_gpu_ctx.d_A_tiles[s], g_gpu_ctx.tile_bytes_A);
+      cudaMalloc((void **)&g_gpu_ctx.d_C_tiles[s], g_gpu_ctx.tile_bytes_C);
     }
-
-    // Check if we need larger C tiles
-    if (required_C > g_gpu_ctx.tile_bytes_C)
-    {
-        g_gpu_ctx.tile_bytes_C = required_C;
-        g_gpu_ctx.max_B_cols = B_cols;
-        needs_realloc = 1;
-    }
-
-    if (needs_realloc)
-    {
-        // Reallocate tiles for all streams
-        for (int s = 0; s < NUM_STREAMS; s++)
-        {
-            if (g_gpu_ctx.d_A_tiles[s])
-                cudaFree(g_gpu_ctx.d_A_tiles[s]);
-            if (g_gpu_ctx.d_C_tiles[s])
-                cudaFree(g_gpu_ctx.d_C_tiles[s]);
-
-            cudaMalloc((void **)&g_gpu_ctx.d_A_tiles[s], g_gpu_ctx.tile_bytes_A);
-            cudaMalloc((void **)&g_gpu_ctx.d_C_tiles[s], g_gpu_ctx.tile_bytes_C);
-        }
-    }
+  }
 }
 
-void init_global_gpu_context()
-{
-    if (g_gpu_ctx.initialized)
-        return;
+void init_global_gpu_context() {
+  if (g_gpu_ctx.initialized)
+    return;
 
-    g_gpu_ctx.tile_bytes_A = 0;
-    g_gpu_ctx.tile_bytes_C = 0;
-    g_gpu_ctx.max_A_cols = 0;
-    g_gpu_ctx.max_B_cols = 0;
+  g_gpu_ctx.tile_bytes_A = 0;
+  g_gpu_ctx.tile_bytes_C = 0;
+  g_gpu_ctx.max_A_cols = 0;
+  g_gpu_ctx.max_B_cols = 0;
 
-    for (int s = 0; s < NUM_STREAMS; s++)
-    {
-        g_gpu_ctx.d_A_tiles[s] = NULL;
-        g_gpu_ctx.d_C_tiles[s] = NULL;
-        cudaStreamCreate(&g_gpu_ctx.streams[s]);
-    }
+  for (int s = 0; s < NUM_STREAMS; s++) {
+    g_gpu_ctx.d_A_tiles[s] = NULL;
+    g_gpu_ctx.d_C_tiles[s] = NULL;
+    cudaStreamCreate(&g_gpu_ctx.streams[s]);
+  }
 
-    g_gpu_ctx.initialized = 1;
+  g_gpu_ctx.initialized = 1;
 }
 
-void cleanup_global_gpu_context()
-{
-    if (!g_gpu_ctx.initialized)
-        return;
+void cleanup_global_gpu_context() {
+  if (!g_gpu_ctx.initialized)
+    return;
 
-    for (int s = 0; s < NUM_STREAMS; s++)
-    {
-        if (g_gpu_ctx.d_A_tiles[s]) cudaFree(g_gpu_ctx.d_A_tiles[s]);
-        if (g_gpu_ctx.d_C_tiles[s]) cudaFree(g_gpu_ctx.d_C_tiles[s]);
-        cudaStreamDestroy(g_gpu_ctx.streams[s]);
-    }
+  for (int s = 0; s < NUM_STREAMS; s++) {
+    if (g_gpu_ctx.d_A_tiles[s])
+      cudaFree(g_gpu_ctx.d_A_tiles[s]);
+    if (g_gpu_ctx.d_C_tiles[s])
+      cudaFree(g_gpu_ctx.d_C_tiles[s]);
+    cudaStreamDestroy(g_gpu_ctx.streams[s]);
+  }
 
-    g_gpu_ctx.initialized = 0;
+  g_gpu_ctx.initialized = 0;
 }
 
-// ! Memory Management
+// --- Memory Management
 // Function to allocate a matrix (contiguous memory allocation)
-Matrix *allocate_matrix(int rows, int cols)
-{
-    Matrix *m = (Matrix *)malloc(sizeof(Matrix));
-    m->rows = rows;
-    m->cols = cols;
-    m->pinned = 1;
-    cudaError_t err =
-        cudaMallocHost((void **)&m->data, rows * cols * sizeof(float));
-    if (err != cudaSuccess)
-    {
-        m->data = (float *)malloc(rows * cols * sizeof(float));
-        m->pinned = 0;
-    }
-    return m;
+Matrix *allocate_matrix(int rows, int cols) {
+  Matrix *m = (Matrix *)malloc(sizeof(Matrix));
+  m->rows = rows;
+  m->cols = cols;
+  m->pinned = 1;
+  cudaError_t err =
+      cudaMallocHost((void **)&m->data, rows * cols * sizeof(float));
+  if (err != cudaSuccess) {
+    m->data = (float *)malloc(rows * cols * sizeof(float));
+    m->pinned = 0;
+  }
+  return m;
 }
 
 // Function to free a matrix
-void free_matrix(Matrix *m)
-{
-    if (m->pinned)
-        cudaFreeHost(m->data);
-    else
-        free(m->data);
-    free(m);
+void free_matrix(Matrix *m) {
+  if (m->pinned)
+    cudaFreeHost(m->data);
+  else
+    free(m->data);
+  free(m);
 }
 
-// ! Matrix Operations
+// --- Matrix Operations
 // Function to initialize matrix with random values using He initialization
-void random_init(Matrix *m)
-{
-    // He initialization: scale by sqrt(2/n_in) for ReLU networks
-    float scale = sqrtf(2.0f / m->rows);
-    for (int i = 0; i < m->rows; i++)
-    {
-        for (int j = 0; j < m->cols; j++)
-        {
-            // Generate random value in range [-1, 1] then scale
-            float rand_val = 2.0f * ((float)rand() / RAND_MAX) - 1.0f;
-            m->data[i * m->cols + j] = rand_val * scale;
-        }
+void random_init(Matrix *m) {
+  // He initialization: scale by sqrt(2/n_in) for ReLU networks
+  float scale = sqrtf(2.0f / m->rows);
+  for (int i = 0; i < m->rows; i++) {
+    for (int j = 0; j < m->cols; j++) {
+      // Generate random value in range [-1, 1] then scale
+      float rand_val = 2.0f * ((float)rand() / RAND_MAX) - 1.0f;
+      m->data[i * m->cols + j] = rand_val * scale;
     }
+  }
 }
 
-// ! Matrix Operations (GPU version)
+// --- Matrix Operations (GPU version)
 __global__ void mat_mult_kernel(float *A, float *B, float *C, int A_rows,
-                                int A_cols, int B_cols)
-{
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
+                                int A_cols, int B_cols) {
+  int row = blockIdx.y * blockDim.y + threadIdx.y;
+  int col = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (row < A_rows && col < B_cols)
-    {
-        float value = 0.0f;
-        for (int k = 0; k < A_cols; k++)
-        {
-            value += A[row * A_cols + k] * B[k * B_cols + col];
-        }
-        C[row * B_cols + col] = value;
+  if (row < A_rows && col < B_cols) {
+    float value = 0.0f;
+    for (int k = 0; k < A_cols; k++) {
+      value += A[row * A_cols + k] * B[k * B_cols + col];
     }
+    C[row * B_cols + col] = value;
+  }
 }
 
 // Function to multiply matrices on the GPU
-Matrix *mat_mult(Matrix *A, Matrix *B)
-{
-    if (A->cols != B->rows)
-    {
-        printf("Incompatible matrices for multiplication.\n");
-        exit(1);
-    }
+Matrix *mat_mult(Matrix *A, Matrix *B) {
+  if (A->cols != B->rows) {
+    printf("Incompatible matrices for multiplication.\n");
+    exit(1);
+  }
 
-    Matrix *C = allocate_matrix(A->rows, B->cols);
+  Matrix *C = allocate_matrix(A->rows, B->cols);
 
-    // Initialize GPU context on first call
-    if (!g_gpu_ctx.initialized)
-    {
-        init_global_gpu_context();
-    }
+  // Initialize GPU context on first call
+  if (!g_gpu_ctx.initialized) {
+    init_global_gpu_context();
+  }
 
-    // Ensure tile buffers are large enough for this operation
-    ensure_tile_capacity(A->cols, B->cols);
+  // Ensure tile buffers are large enough for this operation
+  ensure_tile_capacity(A->cols, B->cols);
 
-    // Allocate and copy B for this operation (no caching - prevents stale data bugs)
-    float *d_B;
-    size_t sizeB = B->rows * B->cols * sizeof(float);
-    cudaMalloc((void **)&d_B, sizeB);
-    cudaMemcpy(d_B, B->data, sizeB, cudaMemcpyHostToDevice);
+  // Allocate and copy B for this operation (no caching - prevents stale data
+  // bugs)
+  float *d_B;
+  size_t sizeB = B->rows * B->cols * sizeof(float);
+  cudaMalloc((void **)&d_B, sizeB);
+  cudaMemcpy(d_B, B->data, sizeB, cudaMemcpyHostToDevice);
 
-    // Tile by rows of A/C with triple buffering and async copies
-    for (int row_start = 0, tile_idx = 0; row_start < A->rows;
-         row_start += TILE_ROWS, tile_idx++)
-    {
-        int tile_rows =
-            (row_start + TILE_ROWS <= A->rows) ? TILE_ROWS : (A->rows - row_start);
-        int s = tile_idx % NUM_STREAMS;
+  // Tile by rows of A/C with triple buffering and async copies
+  for (int row_start = 0, tile_idx = 0; row_start < A->rows;
+       row_start += TILE_ROWS, tile_idx++) {
+    int tile_rows =
+        (row_start + TILE_ROWS <= A->rows) ? TILE_ROWS : (A->rows - row_start);
+    int s = tile_idx % NUM_STREAMS;
 
-        const float *A_tile_host = A->data + row_start * A->cols;
-        cudaMemcpyAsync(g_gpu_ctx.d_A_tiles[s], A_tile_host,
-                        tile_rows * A->cols * sizeof(float), cudaMemcpyHostToDevice,
-                        g_gpu_ctx.streams[s]);
+    const float *A_tile_host = A->data + row_start * A->cols;
+    cudaMemcpyAsync(g_gpu_ctx.d_A_tiles[s], A_tile_host,
+                    tile_rows * A->cols * sizeof(float), cudaMemcpyHostToDevice,
+                    g_gpu_ctx.streams[s]);
 
-        dim3 threadsPerBlock(THREADS_PER_BLOCK, THREADS_PER_BLOCK);
-        dim3 numBlocks((B->cols + threadsPerBlock.x - 1) / threadsPerBlock.x,
-                       (tile_rows + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    dim3 threadsPerBlock(THREADS_PER_BLOCK, THREADS_PER_BLOCK);
+    dim3 numBlocks((B->cols + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                   (tile_rows + threadsPerBlock.y - 1) / threadsPerBlock.y);
 
-        mat_mult_kernel<<<numBlocks, threadsPerBlock, 0, g_gpu_ctx.streams[s]>>>(
-            g_gpu_ctx.d_A_tiles[s], d_B, g_gpu_ctx.d_C_tiles[s],
-            tile_rows, A->cols, B->cols);
+    mat_mult_kernel<<<numBlocks, threadsPerBlock, 0, g_gpu_ctx.streams[s]>>>(
+        g_gpu_ctx.d_A_tiles[s], d_B, g_gpu_ctx.d_C_tiles[s], tile_rows, A->cols,
+        B->cols);
 
-        float *C_tile_host = C->data + row_start * C->cols;
-        cudaMemcpyAsync(C_tile_host, g_gpu_ctx.d_C_tiles[s],
-                        tile_rows * B->cols * sizeof(float), cudaMemcpyDeviceToHost,
-                        g_gpu_ctx.streams[s]);
-    }
+    float *C_tile_host = C->data + row_start * C->cols;
+    cudaMemcpyAsync(C_tile_host, g_gpu_ctx.d_C_tiles[s],
+                    tile_rows * B->cols * sizeof(float), cudaMemcpyDeviceToHost,
+                    g_gpu_ctx.streams[s]);
+  }
 
-    // Synchronize all streams
-    for (int s = 0; s < NUM_STREAMS; s++)
-    {
-        cudaStreamSynchronize(g_gpu_ctx.streams[s]);
-    }
+  // Synchronize all streams
+  for (int s = 0; s < NUM_STREAMS; s++) {
+    cudaStreamSynchronize(g_gpu_ctx.streams[s]);
+  }
 
-    cudaFree(d_B);
+  cudaFree(d_B);
 
-    return C;
+  return C;
 }
 
 // Matrix subtraction: C = A - B
-Matrix *mat_sub(Matrix *A, Matrix *B)
-{
-    if (A->rows != B->rows || A->cols != B->cols)
-    {
-        printf("Incompatible matrices for subtraction.\n");
-        exit(1);
-    }
-    Matrix *C = allocate_matrix(A->rows, A->cols);
-    for (int i = 0; i < A->rows; i++)
-        for (int j = 0; j < A->cols; j++)
-            C->data[i * A->cols + j] =
-                A->data[i * A->cols + j] - B->data[i * A->cols + j];
-    return C;
+Matrix *mat_sub(Matrix *A, Matrix *B) {
+  if (A->rows != B->rows || A->cols != B->cols) {
+    printf("Incompatible matrices for subtraction.\n");
+    exit(1);
+  }
+  Matrix *C = allocate_matrix(A->rows, A->cols);
+  for (int i = 0; i < A->rows; i++)
+    for (int j = 0; j < A->cols; j++)
+      C->data[i * A->cols + j] =
+          A->data[i * A->cols + j] - B->data[i * A->cols + j];
+  return C;
 }
 
 // Matrix scalar multiplication: A = A * scalar
-void mat_scalar_mult(Matrix *A, float scalar)
-{
-    for (int i = 0; i < A->rows; i++)
-        for (int j = 0; j < A->cols; j++)
-            A->data[i * A->cols + j] *= scalar;
+void mat_scalar_mult(Matrix *A, float scalar) {
+  for (int i = 0; i < A->rows; i++)
+    for (int j = 0; j < A->cols; j++)
+      A->data[i * A->cols + j] *= scalar;
 }
 
-// ! Activation Functions
+// --- Activation Functions
 // Function to apply ReLU activation
-void relu(Matrix *m)
-{
-    for (int i = 0; i < m->rows; i++)
-        for (int j = 0; j < m->cols; j++)
-            m->data[i * m->cols + j] = fmaxf(0, m->data[i * m->cols + j]);
+void relu(Matrix *m) {
+  for (int i = 0; i < m->rows; i++)
+    for (int j = 0; j < m->cols; j++)
+      m->data[i * m->cols + j] = fmaxf(0, m->data[i * m->cols + j]);
 }
 
 // Function to compute derivative of ReLU
-Matrix *relu_derivative(Matrix *m)
-{
-    Matrix *derivative = allocate_matrix(m->rows, m->cols);
-    for (int i = 0; i < m->rows; i++)
-        for (int j = 0; j < m->cols; j++)
-            derivative->data[i * m->cols + j] =
-                (m->data[i * m->cols + j] > 0) ? 1 : 0;
-    return derivative;
+Matrix *relu_derivative(Matrix *m) {
+  Matrix *derivative = allocate_matrix(m->rows, m->cols);
+  for (int i = 0; i < m->rows; i++)
+    for (int j = 0; j < m->cols; j++)
+      derivative->data[i * m->cols + j] =
+          (m->data[i * m->cols + j] > 0) ? 1 : 0;
+  return derivative;
 }
 
-// ! Loss Functions
+// --- Loss Functions
 // Function to compute Mean Squared Error
-float mean_squared_error(Matrix *Y_pred, Matrix *Y_true)
-{
-    float mse = 0.0f;
-    for (int i = 0; i < Y_pred->rows; i++)
-        for (int j = 0; j < Y_pred->cols; j++)
-            mse += pow(Y_pred->data[i * Y_pred->cols + j] -
-                           Y_true->data[i * Y_true->cols + j],
-                       2);
-    return mse / Y_pred->rows;
+float mean_squared_error(Matrix *Y_pred, Matrix *Y_true) {
+  float mse = 0.0f;
+  for (int i = 0; i < Y_pred->rows; i++)
+    for (int j = 0; j < Y_pred->cols; j++)
+      mse += pow(Y_pred->data[i * Y_pred->cols + j] -
+                     Y_true->data[i * Y_true->cols + j],
+                 2);
+  return mse / Y_pred->rows;
 }
 
-// ! Optimization
+// --- Optimization
 // Function to clip gradients to prevent explosions
-void clip_gradients(Matrix *grad, float max_norm)
-{
-    float norm = 0.0f;
+void clip_gradients(Matrix *grad, float max_norm) {
+  float norm = 0.0f;
 
-    // Compute gradient norm
-    for (int i = 0; i < grad->rows * grad->cols; i++)
-    {
-        norm += grad->data[i] * grad->data[i];
-    }
-    norm = sqrtf(norm);
+  // Compute gradient norm
+  for (int i = 0; i < grad->rows * grad->cols; i++) {
+    norm += grad->data[i] * grad->data[i];
+  }
+  norm = sqrtf(norm);
 
-    // Clip if necessary
-    if (norm > max_norm)
-    {
-        float scale = max_norm / (norm + 1e-6f);
-        for (int i = 0; i < grad->rows * grad->cols; i++)
-        {
-            grad->data[i] *= scale;
-        }
+  // Clip if necessary
+  if (norm > max_norm) {
+    float scale = max_norm / (norm + 1e-6f);
+    for (int i = 0; i < grad->rows * grad->cols; i++) {
+      grad->data[i] *= scale;
     }
+  }
 }
 
 // Function to update weights: W = W - learning_rate * grad
-void update_weights(Matrix *W, Matrix *grad, float learning_rate)
-{
-    // Clip gradients before updating (more aggressive for deeper network)
-    clip_gradients(grad, 3.0f);
+void update_weights(Matrix *W, Matrix *grad, float learning_rate) {
+  // Clip gradients before updating (more aggressive for deeper network)
+  clip_gradients(grad, 3.0f);
 
-    for (int i = 0; i < W->rows; i++)
-        for (int j = 0; j < W->cols; j++)
-            W->data[i * W->cols + j] -=
-                learning_rate * grad->data[i * grad->cols + j];
+  for (int i = 0; i < W->rows; i++)
+    for (int j = 0; j < W->cols; j++)
+      W->data[i * W->cols + j] -=
+          learning_rate * grad->data[i * grad->cols + j];
 }
 
 // Function to perform backpropagation and update weights for three hidden
 // layers
 void backpropagation(Matrix *X_batch, Matrix *Y_batch, Matrix *Z1, Matrix *Z2,
                      Matrix *Z3, Matrix *Y_pred, Matrix *W1, Matrix *W2,
-                     Matrix *W3, Matrix *W4, int batch_size)
-{
-    // Compute dZ4 = Y_pred - Y_batch
-    Matrix *dZ4 = mat_sub(Y_pred, Y_batch);
-    mat_scalar_mult(dZ4, 2.0f / batch_size);
+                     Matrix *W3, Matrix *W4, int batch_size) {
+  // Compute dZ4 = Y_pred - Y_batch
+  Matrix *dZ4 = mat_sub(Y_pred, Y_batch);
+  mat_scalar_mult(dZ4, 2.0f / batch_size);
 
-    // Compute dW4 = Z3^T * dZ4
-    Matrix *Z3_T = allocate_matrix(Z3->cols, Z3->rows);
-    for (int i = 0; i < Z3->rows; i++)
-    {
-        for (int j = 0; j < Z3->cols; j++)
-        {
-            Z3_T->data[j * Z3->rows + i] = Z3->data[i * Z3->cols + j];
-        }
+  // Compute dW4 = Z3^T * dZ4
+  Matrix *Z3_T = allocate_matrix(Z3->cols, Z3->rows);
+  for (int i = 0; i < Z3->rows; i++) {
+    for (int j = 0; j < Z3->cols; j++) {
+      Z3_T->data[j * Z3->rows + i] = Z3->data[i * Z3->cols + j];
     }
-    Matrix *dW4 = mat_mult(Z3_T, dZ4);
-    update_weights(W4, dW4, LEARNING_RATE);
-    free_matrix(dW4);
-    free_matrix(Z3_T);
+  }
+  Matrix *dW4 = mat_mult(Z3_T, dZ4);
+  update_weights(W4, dW4, LEARNING_RATE);
+  free_matrix(dW4);
+  free_matrix(Z3_T);
 
-    // Compute dZ3 = dZ4 * W4^T
-    Matrix *W4_T = allocate_matrix(W4->cols, W4->rows);
-    for (int i = 0; i < W4->rows; i++)
-    {
-        for (int j = 0; j < W4->cols; j++)
-        {
-            W4_T->data[j * W4->rows + i] = W4->data[i * W4->cols + j];
-        }
+  // Compute dZ3 = dZ4 * W4^T
+  Matrix *W4_T = allocate_matrix(W4->cols, W4->rows);
+  for (int i = 0; i < W4->rows; i++) {
+    for (int j = 0; j < W4->cols; j++) {
+      W4_T->data[j * W4->rows + i] = W4->data[i * W4->cols + j];
     }
-    Matrix *dZ3 = mat_mult(dZ4, W4_T);
+  }
+  Matrix *dZ3 = mat_mult(dZ4, W4_T);
 
-    // Apply ReLU derivative for third hidden layer
-    Matrix *dZ3_derivative = relu_derivative(Z3);
-    for (int i = 0; i < dZ3->rows; i++)
-    {
-        for (int j = 0; j < dZ3->cols; j++)
-        {
-            dZ3->data[i * dZ3->cols + j] *=
-                dZ3_derivative->data[i * dZ3_derivative->cols + j];
-        }
+  // Apply ReLU derivative for third hidden layer
+  Matrix *dZ3_derivative = relu_derivative(Z3);
+  for (int i = 0; i < dZ3->rows; i++) {
+    for (int j = 0; j < dZ3->cols; j++) {
+      dZ3->data[i * dZ3->cols + j] *=
+          dZ3_derivative->data[i * dZ3_derivative->cols + j];
     }
-    free_matrix(dZ3_derivative);
-    free_matrix(W4_T);
+  }
+  free_matrix(dZ3_derivative);
+  free_matrix(W4_T);
 
-    // Compute dW3 = Z2^T * dZ3
-    Matrix *Z2_T = allocate_matrix(Z2->cols, Z2->rows);
-    for (int i = 0; i < Z2->rows; i++)
-    {
-        for (int j = 0; j < Z2->cols; j++)
-        {
-            Z2_T->data[j * Z2->rows + i] = Z2->data[i * Z2->cols + j];
-        }
+  // Compute dW3 = Z2^T * dZ3
+  Matrix *Z2_T = allocate_matrix(Z2->cols, Z2->rows);
+  for (int i = 0; i < Z2->rows; i++) {
+    for (int j = 0; j < Z2->cols; j++) {
+      Z2_T->data[j * Z2->rows + i] = Z2->data[i * Z2->cols + j];
     }
-    Matrix *dW3 = mat_mult(Z2_T, dZ3);
-    update_weights(W3, dW3, LEARNING_RATE);
-    free_matrix(dW3);
-    free_matrix(Z2_T);
+  }
+  Matrix *dW3 = mat_mult(Z2_T, dZ3);
+  update_weights(W3, dW3, LEARNING_RATE);
+  free_matrix(dW3);
+  free_matrix(Z2_T);
 
-    // Compute dZ2 = dZ3 * W3^T
-    Matrix *W3_T = allocate_matrix(W3->cols, W3->rows);
-    for (int i = 0; i < W3->rows; i++)
-    {
-        for (int j = 0; j < W3->cols; j++)
-        {
-            W3_T->data[j * W3->rows + i] = W3->data[i * W3->cols + j];
-        }
+  // Compute dZ2 = dZ3 * W3^T
+  Matrix *W3_T = allocate_matrix(W3->cols, W3->rows);
+  for (int i = 0; i < W3->rows; i++) {
+    for (int j = 0; j < W3->cols; j++) {
+      W3_T->data[j * W3->rows + i] = W3->data[i * W3->cols + j];
     }
-    Matrix *dZ2 = mat_mult(dZ3, W3_T);
+  }
+  Matrix *dZ2 = mat_mult(dZ3, W3_T);
 
-    // Apply ReLU derivative for second hidden layer
-    Matrix *dZ2_derivative = relu_derivative(Z2);
-    for (int i = 0; i < dZ2->rows; i++)
-    {
-        for (int j = 0; j < dZ2->cols; j++)
-        {
-            dZ2->data[i * dZ2->cols + j] *=
-                dZ2_derivative->data[i * dZ2_derivative->cols + j];
-        }
+  // Apply ReLU derivative for second hidden layer
+  Matrix *dZ2_derivative = relu_derivative(Z2);
+  for (int i = 0; i < dZ2->rows; i++) {
+    for (int j = 0; j < dZ2->cols; j++) {
+      dZ2->data[i * dZ2->cols + j] *=
+          dZ2_derivative->data[i * dZ2_derivative->cols + j];
     }
-    free_matrix(dZ2_derivative);
-    free_matrix(W3_T);
+  }
+  free_matrix(dZ2_derivative);
+  free_matrix(W3_T);
 
-    // Compute dW2 = Z1^T * dZ2
-    Matrix *Z1_T = allocate_matrix(Z1->cols, Z1->rows);
-    for (int i = 0; i < Z1->rows; i++)
-    {
-        for (int j = 0; j < Z1->cols; j++)
-        {
-            Z1_T->data[j * Z1->rows + i] = Z1->data[i * Z1->cols + j];
-        }
+  // Compute dW2 = Z1^T * dZ2
+  Matrix *Z1_T = allocate_matrix(Z1->cols, Z1->rows);
+  for (int i = 0; i < Z1->rows; i++) {
+    for (int j = 0; j < Z1->cols; j++) {
+      Z1_T->data[j * Z1->rows + i] = Z1->data[i * Z1->cols + j];
     }
-    Matrix *dW2 = mat_mult(Z1_T, dZ2);
-    update_weights(W2, dW2, LEARNING_RATE);
-    free_matrix(dW2);
-    free_matrix(Z1_T);
+  }
+  Matrix *dW2 = mat_mult(Z1_T, dZ2);
+  update_weights(W2, dW2, LEARNING_RATE);
+  free_matrix(dW2);
+  free_matrix(Z1_T);
 
-    // Compute dZ1 = dZ2 * W2^T
-    Matrix *W2_T = allocate_matrix(W2->cols, W2->rows);
-    for (int i = 0; i < W2->rows; i++)
-    {
-        for (int j = 0; j < W2->cols; j++)
-        {
-            W2_T->data[j * W2->rows + i] = W2->data[i * W2->cols + j];
-        }
+  // Compute dZ1 = dZ2 * W2^T
+  Matrix *W2_T = allocate_matrix(W2->cols, W2->rows);
+  for (int i = 0; i < W2->rows; i++) {
+    for (int j = 0; j < W2->cols; j++) {
+      W2_T->data[j * W2->rows + i] = W2->data[i * W2->cols + j];
     }
-    Matrix *dZ1 = mat_mult(dZ2, W2_T);
+  }
+  Matrix *dZ1 = mat_mult(dZ2, W2_T);
 
-    // Apply ReLU derivative for first hidden layer
-    Matrix *dZ1_derivative = relu_derivative(Z1);
-    for (int i = 0; i < dZ1->rows; i++)
-    {
-        for (int j = 0; j < dZ1->cols; j++)
-        {
-            dZ1->data[i * dZ1->cols + j] *=
-                dZ1_derivative->data[i * dZ1_derivative->cols + j];
-        }
+  // Apply ReLU derivative for first hidden layer
+  Matrix *dZ1_derivative = relu_derivative(Z1);
+  for (int i = 0; i < dZ1->rows; i++) {
+    for (int j = 0; j < dZ1->cols; j++) {
+      dZ1->data[i * dZ1->cols + j] *=
+          dZ1_derivative->data[i * dZ1_derivative->cols + j];
     }
-    free_matrix(dZ1_derivative);
-    free_matrix(W2_T);
+  }
+  free_matrix(dZ1_derivative);
+  free_matrix(W2_T);
 
-    // Compute dW1 = X_batch^T * dZ1
-    Matrix *X_batch_T = allocate_matrix(X_batch->cols, X_batch->rows);
-    for (int i = 0; i < X_batch->rows; i++)
-    {
-        for (int j = 0; j < X_batch->cols; j++)
-        {
-            X_batch_T->data[j * X_batch->rows + i] =
-                X_batch->data[i * X_batch->cols + j];
-        }
+  // Compute dW1 = X_batch^T * dZ1
+  Matrix *X_batch_T = allocate_matrix(X_batch->cols, X_batch->rows);
+  for (int i = 0; i < X_batch->rows; i++) {
+    for (int j = 0; j < X_batch->cols; j++) {
+      X_batch_T->data[j * X_batch->rows + i] =
+          X_batch->data[i * X_batch->cols + j];
     }
-    Matrix *dW1 = mat_mult(X_batch_T, dZ1);
-    update_weights(W1, dW1, LEARNING_RATE);
-    free_matrix(dW1);
-    free_matrix(X_batch_T);
+  }
+  Matrix *dW1 = mat_mult(X_batch_T, dZ1);
+  update_weights(W1, dW1, LEARNING_RATE);
+  free_matrix(dW1);
+  free_matrix(X_batch_T);
 
-    // Free allocated matrices
-    free_matrix(dZ4);
-    free_matrix(dZ3);
-    free_matrix(dZ2);
-    free_matrix(dZ1);
+  // Free allocated matrices
+  free_matrix(dZ4);
+  free_matrix(dZ3);
+  free_matrix(dZ2);
+  free_matrix(dZ1);
 }
 
-// ! Batch Processing
+// --- Batch Processing
 // Function to get a batch from the dataset
 void get_batch(Matrix *X, Matrix *Y, Matrix *X_batch, Matrix *Y_batch,
-               int batch_start, int batch_size)
-{
-    for (int i = 0; i < batch_size; i++)
-    {
-        for (int j = 0; j < INPUT_SIZE; j++)
-            X_batch->data[i * INPUT_SIZE + j] =
-                X->data[(batch_start + i) * INPUT_SIZE + j];
-        Y_batch->data[i * OUTPUT_SIZE] = Y->data[(batch_start + i) * OUTPUT_SIZE];
-    }
+               int batch_start, int batch_size) {
+  for (int i = 0; i < batch_size; i++) {
+    for (int j = 0; j < INPUT_SIZE; j++)
+      X_batch->data[i * INPUT_SIZE + j] =
+          X->data[(batch_start + i) * INPUT_SIZE + j];
+    Y_batch->data[i * OUTPUT_SIZE] = Y->data[(batch_start + i) * OUTPUT_SIZE];
+  }
 }
 
-// ! Data Loading
+// --- Data Loading
 // Function to load CSV and populate X and Y, Assuming the last column is Y
-int load_csv(const char *filename, Matrix **X, Matrix **Y, int *num_samples)
-{
-    FILE *file = fopen(filename, "r");
-    if (!file)
-    {
-        printf("Failed to open file.\n");
-        return -1;
+int load_csv(const char *filename, Matrix **X, Matrix **Y, int *num_samples) {
+  FILE *file = fopen(filename, "r");
+  if (!file) {
+    printf("Failed to open file.\n");
+    return -1;
+  }
+  char line[1024];
+  int count = 0;
+  // First pass to count samples
+  while (fgets(line, sizeof(line), file))
+    count++;
+  *num_samples = count;
+  rewind(file);
+  // Allocate X and Y
+  *X = allocate_matrix(count, INPUT_SIZE);
+  *Y = allocate_matrix(count, OUTPUT_SIZE);
+  int i = 0;
+  while (fgets(line, sizeof(line), file)) {
+    char *token = strtok(line, ",");
+    int j = 0;
+    while (token) {
+      if (j < INPUT_SIZE) {
+        (*X)->data[i * INPUT_SIZE + j] = atof(token);
+      } else {
+        (*Y)->data[i * OUTPUT_SIZE] = atof(token);
+      }
+      j++;
+      token = strtok(NULL, ",");
     }
-    char line[1024];
-    int count = 0;
-    // First pass to count samples
-    while (fgets(line, sizeof(line), file))
-        count++;
-    *num_samples = count;
-    rewind(file);
-    // Allocate X and Y
-    *X = allocate_matrix(count, INPUT_SIZE);
-    *Y = allocate_matrix(count, OUTPUT_SIZE);
-    int i = 0;
-    while (fgets(line, sizeof(line), file))
-    {
-        char *token = strtok(line, ",");
-        int j = 0;
-        while (token)
-        {
-            if (j < INPUT_SIZE)
-            {
-                (*X)->data[i * INPUT_SIZE + j] = atof(token);
-            }
-            else
-            {
-                (*Y)->data[i * OUTPUT_SIZE] = atof(token);
-            }
-            j++;
-            token = strtok(NULL, ",");
-        }
-        i++;
-    }
-    fclose(file);
-    return 0;
+    i++;
+  }
+  fclose(file);
+  return 0;
 }
 
 // Main function
-int main(int argc, char *argv[])
-{
-    if (argc != 2)
-    {
-        printf("Usage: %s <data.csv>\n", argv[0]);
-        return -1;
+int main(int argc, char *argv[]) {
+  if (argc != 2) {
+    printf("Usage: %s <data.csv>\n", argv[0]);
+    return -1;
+  }
+
+  double start_time, end_time;
+  double total_time = 0.0;
+  float total_final_mse = 0.0f;
+
+  Matrix *X, *Y;
+  int num_samples;
+  if (load_csv(argv[1], &X, &Y, &num_samples) != 0)
+    return -1;
+
+  // Run training multiple times
+  for (int run = 0; run < NUM_TEST_RUNS; run++) {
+    // Allocate and initialize weights for three hidden layers
+    Matrix *W1 = allocate_matrix(INPUT_SIZE, HIDDEN_SIZE_1);
+    Matrix *W2 = allocate_matrix(HIDDEN_SIZE_1, HIDDEN_SIZE_2);
+    Matrix *W3 = allocate_matrix(HIDDEN_SIZE_2, HIDDEN_SIZE_3);
+    Matrix *W4 = allocate_matrix(HIDDEN_SIZE_3, OUTPUT_SIZE);
+    random_init(W1);
+    random_init(W2);
+    random_init(W3);
+    random_init(W4);
+
+    // Start measuring time
+    start_time = omp_get_wtime();
+
+    float final_mse = 0.0f;
+
+    // Training loop
+    for (int epoch = 0; epoch < EPOCHS; epoch++) {
+      for (int batch_start = 0; batch_start < num_samples;
+           batch_start += BATCH_SIZE) {
+        int batch_end = fmin(batch_start + BATCH_SIZE, num_samples);
+        int batch_size = batch_end - batch_start;
+
+        // Extract batch
+        Matrix *X_batch = allocate_matrix(batch_size, INPUT_SIZE);
+        Matrix *Y_batch = allocate_matrix(batch_size, OUTPUT_SIZE);
+        get_batch(X, Y, X_batch, Y_batch, batch_start, batch_size);
+
+        // Forward pass: X -> Hidden Layer 1 -> ReLU -> Hidden Layer 2 -> ReLU
+        // -> Hidden Layer 3 -> ReLU -> Output Layer
+        Matrix *Z1 = mat_mult(X_batch, W1);
+        relu(Z1);
+        Matrix *Z2 = mat_mult(Z1, W2);
+        relu(Z2);
+        Matrix *Z3 = mat_mult(Z2, W3);
+        relu(Z3);
+        Matrix *Y_pred = mat_mult(Z3, W4);
+
+        // Compute loss
+        final_mse = mean_squared_error(Y_pred, Y_batch);
+
+        // Backward pass
+        backpropagation(X_batch, Y_batch, Z1, Z2, Z3, Y_pred, W1, W2, W3, W4,
+                        batch_size);
+
+        // Free allocated matrices
+        free_matrix(Z1);
+        free_matrix(Z2);
+        free_matrix(Z3);
+        free_matrix(Y_pred);
+        free_matrix(X_batch);
+        free_matrix(Y_batch);
+      }
     }
 
-    double start_time, end_time;
-    double total_time = 0.0;
-    float total_final_mse = 0.0f;
+    // Stop measuring time
+    end_time = omp_get_wtime();
+    total_time += (end_time - start_time);
+    total_final_mse += final_mse;
 
-    Matrix *X, *Y;
-    int num_samples;
-    if (load_csv(argv[1], &X, &Y, &num_samples) != 0)
-        return -1;
+    // Cleanup weights for this run
+    free_matrix(W1);
+    free_matrix(W2);
+    free_matrix(W3);
+    free_matrix(W4);
+  }
 
-    // Run training multiple times
-    for (int run = 0; run < NUM_TEST_RUNS; run++)
-    {
-        // Allocate and initialize weights for three hidden layers
-        Matrix *W1 = allocate_matrix(INPUT_SIZE, HIDDEN_SIZE_1);
-        Matrix *W2 = allocate_matrix(HIDDEN_SIZE_1, HIDDEN_SIZE_2);
-        Matrix *W3 = allocate_matrix(HIDDEN_SIZE_2, HIDDEN_SIZE_3);
-        Matrix *W4 = allocate_matrix(HIDDEN_SIZE_3, OUTPUT_SIZE);
-        random_init(W1);
-        random_init(W2);
-        random_init(W3);
-        random_init(W4);
+  // Print average training time and MSE
+  printf("Average training time over %d runs: %.4f seconds | Average final "
+         "MSE: %.6f\n",
+         NUM_TEST_RUNS, total_time / NUM_TEST_RUNS,
+         total_final_mse / NUM_TEST_RUNS);
 
-        // Start measuring time
-        start_time = omp_get_wtime();
+  // Cleanup data
+  free_matrix(X);
+  free_matrix(Y);
 
-        float final_mse = 0.0f;
+  cleanup_global_gpu_context();
 
-        // Training loop
-        for (int epoch = 0; epoch < EPOCHS; epoch++)
-        {
-            for (int batch_start = 0; batch_start < num_samples;
-                 batch_start += BATCH_SIZE)
-            {
-                int batch_end = fmin(batch_start + BATCH_SIZE, num_samples);
-                int batch_size = batch_end - batch_start;
-
-                // Extract batch
-                Matrix *X_batch = allocate_matrix(batch_size, INPUT_SIZE);
-                Matrix *Y_batch = allocate_matrix(batch_size, OUTPUT_SIZE);
-                get_batch(X, Y, X_batch, Y_batch, batch_start, batch_size);
-
-                // Forward pass: X -> Hidden Layer 1 -> ReLU -> Hidden Layer 2 -> ReLU
-                // -> Hidden Layer 3 -> ReLU -> Output Layer
-                Matrix *Z1 = mat_mult(X_batch, W1);
-                relu(Z1);
-                Matrix *Z2 = mat_mult(Z1, W2);
-                relu(Z2);
-                Matrix *Z3 = mat_mult(Z2, W3);
-                relu(Z3);
-                Matrix *Y_pred = mat_mult(Z3, W4);
-
-                // Compute loss
-                final_mse = mean_squared_error(Y_pred, Y_batch);
-
-                // Backward pass
-                backpropagation(X_batch, Y_batch, Z1, Z2, Z3, Y_pred, W1, W2, W3, W4,
-                                batch_size);
-
-                // Free allocated matrices
-                free_matrix(Z1);
-                free_matrix(Z2);
-                free_matrix(Z3);
-                free_matrix(Y_pred);
-                free_matrix(X_batch);
-                free_matrix(Y_batch);
-            }
-        }
-
-        // Stop measuring time
-        end_time = omp_get_wtime();
-        total_time += (end_time - start_time);
-        total_final_mse += final_mse;
-
-        // Cleanup weights for this run
-        free_matrix(W1);
-        free_matrix(W2);
-        free_matrix(W3);
-        free_matrix(W4);
-    }
-
-    // Print average training time and MSE
-    printf("Average training time over %d runs: %.4f seconds | Average final MSE: %.6f\n", NUM_TEST_RUNS,
-           total_time / NUM_TEST_RUNS, total_final_mse / NUM_TEST_RUNS);
-
-    // Cleanup data
-    free_matrix(X);
-    free_matrix(Y);
-
-    cleanup_global_gpu_context();
-
-    return 0;
+  return 0;
 }

@@ -17,7 +17,7 @@ datasets=("small" "medium" "large")
 # Run each variant on each dataset
 for variant in "${variants[@]}"; do
   echo "Testing: nn_cuda_${variant}"
-  
+
   for dataset in "${datasets[@]}"; do
     echo "Dataset: $dataset"
     ./nn_cuda_${variant} ../reference/data/synthetic_convex_${dataset}.csv

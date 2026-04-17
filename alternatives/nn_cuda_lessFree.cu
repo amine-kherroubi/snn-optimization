@@ -1,5 +1,6 @@
-// Parallel matrix multiplication using CUDA
-// Optimized version: pre-allocate reusable matrices to minimize malloc/free
+// Parallel matrix multiplication using CUDA.
+// Optimized version: pre-allocate reusable matrices to minimize allocation
+// overhead.
 #include <cuda_runtime.h>
 #include <math.h>
 #include <omp.h>
@@ -7,621 +8,609 @@
 #include <stdlib.h>
 #include <string.h>
 
-// ! Network Parameters
+// --- Network parameters ---
 #define INPUT_SIZE 32   // Number of input features
 #define HIDDEN_SIZE 256 // Number of neurons in the hidden layer
 #define OUTPUT_SIZE 1   // Number of output neurons
 #define EPOCHS 100      // Number of training epochs
 #define LEARNING_RATE 0.002
-#define BATCH_SIZE 256 // Batch size for SGD
+#define BATCH_SIZE 256 // Batch size for SGD.
 #define THREADS_PER_BLOCK 16
-#define NUM_TEST_RUNS 10 // Number of times to run training for averaging
-#define NUM_STREAMS 3
-#define TILE_ROWS 128
-#define NUM_PREALLOCATED 10 // Number of pre-allocated reusable matrices
+#define TEST_RUN_COUNT 10 // Number of runs for averaging.
+#define STREAM_COUNT 3
+#define TILE_ROW_COUNT 128
+#define PREALLOCATED_MATRIX_COUNT                                              \
+  10 // Number of pre-allocated reusable matrices.
 
-// ! Data Structures
-typedef struct
-{
-    int rows;
-    int cols;
-    float *data;
-    int pinned;
-    int reusable; // 1 = part of pre-allocated pool, should not be individually freed
+// --- Data structures ---
+typedef struct {
+  int row_count;
+  int column_count;
+  float *data;
+  int uses_pinned_memory;
+  int is_reusable; // 1 = part of pre-allocated pool, should not be individually
+                   // freed.
 } Matrix;
 
-// Global GPU context to avoid repeated allocations
-typedef struct
-{
-    float *d_A_tiles[NUM_STREAMS];
-    float *d_C_tiles[NUM_STREAMS];
-    cudaStream_t streams[NUM_STREAMS];
-    size_t tile_bytes_A;
-    size_t tile_bytes_C;
-    int max_A_cols;  // Add: Track max A columns for tile allocation
-    int max_B_cols;  // Add: Track max B columns for tile allocation
-    int initialized;
+typedef struct {
+  float *device_left_tiles[STREAM_COUNT];
+  float *device_result_tiles[STREAM_COUNT];
+  cudaStream_t streams[STREAM_COUNT];
+  size_t left_tile_byte_count;
+  size_t result_tile_byte_count;
+  int maximum_left_column_count;
+  int maximum_right_column_count;
+  int initialized;
 } GlobalGPUContext;
 
-static GlobalGPUContext g_gpu_ctx = {0};
+static GlobalGPUContext global_gpu_context;
 
-// Pre-allocated matrix pool for training loop temporaries
-typedef struct
-{
-    Matrix X_batch;   // 0: BATCH_SIZE x INPUT_SIZE
-    Matrix Y_batch;   // 1: BATCH_SIZE x OUTPUT_SIZE
-    Matrix Z1;        // 2: BATCH_SIZE x HIDDEN_SIZE
-    Matrix Y_pred;    // 3: BATCH_SIZE x OUTPUT_SIZE
-    Matrix dZ2;       // 4: BATCH_SIZE x OUTPUT_SIZE
-    Matrix Z1_T;      // 5: HIDDEN_SIZE x BATCH_SIZE
-    Matrix dW2;       // 6: HIDDEN_SIZE x OUTPUT_SIZE
-    Matrix W2_T;      // 7: OUTPUT_SIZE x HIDDEN_SIZE
-    Matrix dZ1;       // 8: BATCH_SIZE x HIDDEN_SIZE
-    Matrix X_batch_T; // 9: INPUT_SIZE x BATCH_SIZE
-    // dZ1_derivative reuses dW1 memory since they don't overlap in lifetime
-    // dW1 is computed after dZ1_derivative is consumed
-    float *dZ1_deriv_data; // Extra buffer: BATCH_SIZE x HIDDEN_SIZE
-    float *dW1_data;       // Extra buffer: INPUT_SIZE x HIDDEN_SIZE
-    int initialized;
+typedef struct {
+  Matrix X_batch;   // BATCH_SIZE x INPUT_SIZE
+  Matrix Y_batch;   // BATCH_SIZE x OUTPUT_SIZE
+  Matrix Z1;        // BATCH_SIZE x HIDDEN_SIZE
+  Matrix Y_pred;    // BATCH_SIZE x OUTPUT_SIZE
+  Matrix dZ2;       // BATCH_SIZE x OUTPUT_SIZE
+  Matrix Z1_T;      // HIDDEN_SIZE x BATCH_SIZE
+  Matrix dW2;       // HIDDEN_SIZE x OUTPUT_SIZE
+  Matrix W2_T;      // OUTPUT_SIZE x HIDDEN_SIZE
+  Matrix dZ1;       // BATCH_SIZE x HIDDEN_SIZE
+  Matrix X_batch_T; // INPUT_SIZE x BATCH_SIZE
+
+  float *dZ1_deriv_data; // BATCH_SIZE x HIDDEN_SIZE
+  float *dW1_data;       // INPUT_SIZE x HIDDEN_SIZE
+  int initialized;
 } MatrixPool;
 
-static MatrixPool g_pool = {0};
+static MatrixPool matrix_pool;
 
-void init_pool_matrix(Matrix *m, int rows, int cols)
-{
-    m->rows = rows;
-    m->cols = cols;
-    m->reusable = 1;
-    m->pinned = 1;
-    cudaError_t err =
-        cudaMallocHost((void **)&m->data, rows * cols * sizeof(float));
-    if (err != cudaSuccess)
-    {
-        m->data = (float *)malloc(rows * cols * sizeof(float));
-        m->pinned = 0;
+static void initialize_pool_matrix(Matrix *matrix, int row_count,
+                                   int column_count) {
+  matrix->row_count = row_count;
+  matrix->column_count = column_count;
+  matrix->is_reusable = 1;
+  matrix->uses_pinned_memory = 1;
+
+  size_t byte_count = (size_t)row_count * (size_t)column_count * sizeof(float);
+  cudaError_t error = cudaMallocHost((void **)&matrix->data, byte_count);
+  if (error != cudaSuccess) {
+    matrix->data = (float *)malloc(byte_count);
+    matrix->uses_pinned_memory = 0;
+  }
+}
+
+static void free_pool_matrix(Matrix *matrix) {
+  if (matrix->uses_pinned_memory) {
+    cudaFreeHost(matrix->data);
+  } else {
+    free(matrix->data);
+  }
+  matrix->data = NULL;
+}
+
+static void initialize_matrix_pool() {
+  if (matrix_pool.initialized) {
+    return;
+  }
+
+  initialize_pool_matrix(&matrix_pool.X_batch, BATCH_SIZE, INPUT_SIZE);
+  initialize_pool_matrix(&matrix_pool.Y_batch, BATCH_SIZE, OUTPUT_SIZE);
+  initialize_pool_matrix(&matrix_pool.Z1, BATCH_SIZE, HIDDEN_SIZE);
+  initialize_pool_matrix(&matrix_pool.Y_pred, BATCH_SIZE, OUTPUT_SIZE);
+  initialize_pool_matrix(&matrix_pool.dZ2, BATCH_SIZE, OUTPUT_SIZE);
+  initialize_pool_matrix(&matrix_pool.Z1_T, HIDDEN_SIZE, BATCH_SIZE);
+  initialize_pool_matrix(&matrix_pool.dW2, HIDDEN_SIZE, OUTPUT_SIZE);
+  initialize_pool_matrix(&matrix_pool.W2_T, OUTPUT_SIZE, HIDDEN_SIZE);
+  initialize_pool_matrix(&matrix_pool.dZ1, BATCH_SIZE, HIDDEN_SIZE);
+  initialize_pool_matrix(&matrix_pool.X_batch_T, INPUT_SIZE, BATCH_SIZE);
+
+  matrix_pool.dZ1_deriv_data =
+      (float *)malloc((size_t)BATCH_SIZE * (size_t)HIDDEN_SIZE * sizeof(float));
+  matrix_pool.dW1_data =
+      (float *)malloc((size_t)INPUT_SIZE * (size_t)HIDDEN_SIZE * sizeof(float));
+
+  matrix_pool.initialized = 1;
+  printf("[Pool] Pre-allocated %d reusable matrices + 2 extra buffers\n",
+         PREALLOCATED_MATRIX_COUNT);
+}
+
+static void cleanup_matrix_pool() {
+  if (!matrix_pool.initialized) {
+    return;
+  }
+
+  free_pool_matrix(&matrix_pool.X_batch);
+  free_pool_matrix(&matrix_pool.Y_batch);
+  free_pool_matrix(&matrix_pool.Z1);
+  free_pool_matrix(&matrix_pool.Y_pred);
+  free_pool_matrix(&matrix_pool.dZ2);
+  free_pool_matrix(&matrix_pool.Z1_T);
+  free_pool_matrix(&matrix_pool.dW2);
+  free_pool_matrix(&matrix_pool.W2_T);
+  free_pool_matrix(&matrix_pool.dZ1);
+  free_pool_matrix(&matrix_pool.X_batch_T);
+
+  free(matrix_pool.dZ1_deriv_data);
+  free(matrix_pool.dW1_data);
+
+  matrix_pool.initialized = 0;
+  printf("[Pool] Freed all pre-allocated matrices\n");
+}
+
+static void ensure_tile_capacity(int left_column_count,
+                                 int right_column_count) {
+  size_t required_left_tile_byte_count =
+      (size_t)TILE_ROW_COUNT * (size_t)left_column_count * sizeof(float);
+  size_t required_result_tile_byte_count =
+      (size_t)TILE_ROW_COUNT * (size_t)right_column_count * sizeof(float);
+
+  int needs_reallocation = 0;
+
+  if (required_left_tile_byte_count > global_gpu_context.left_tile_byte_count) {
+    global_gpu_context.left_tile_byte_count = required_left_tile_byte_count;
+    global_gpu_context.maximum_left_column_count = left_column_count;
+    needs_reallocation = 1;
+  }
+
+  if (required_result_tile_byte_count >
+      global_gpu_context.result_tile_byte_count) {
+    global_gpu_context.result_tile_byte_count = required_result_tile_byte_count;
+    global_gpu_context.maximum_right_column_count = right_column_count;
+    needs_reallocation = 1;
+  }
+
+  if (needs_reallocation) {
+    for (int stream_index = 0; stream_index < STREAM_COUNT; stream_index++) {
+      if (global_gpu_context.device_left_tiles[stream_index] != NULL) {
+        cudaFree(global_gpu_context.device_left_tiles[stream_index]);
+      }
+      if (global_gpu_context.device_result_tiles[stream_index] != NULL) {
+        cudaFree(global_gpu_context.device_result_tiles[stream_index]);
+      }
+
+      cudaMalloc((void **)&global_gpu_context.device_left_tiles[stream_index],
+                 global_gpu_context.left_tile_byte_count);
+      cudaMalloc((void **)&global_gpu_context.device_result_tiles[stream_index],
+                 global_gpu_context.result_tile_byte_count);
     }
+  }
 }
 
-void free_pool_matrix(Matrix *m)
-{
-    if (m->pinned)
-        cudaFreeHost(m->data);
-    else
-        free(m->data);
-    m->data = NULL;
+static void initialize_global_gpu_context() {
+  if (global_gpu_context.initialized) {
+    return;
+  }
+
+  global_gpu_context.left_tile_byte_count = 0;
+  global_gpu_context.result_tile_byte_count = 0;
+  global_gpu_context.maximum_left_column_count = 0;
+  global_gpu_context.maximum_right_column_count = 0;
+
+  for (int stream_index = 0; stream_index < STREAM_COUNT; stream_index++) {
+    global_gpu_context.device_left_tiles[stream_index] = NULL;
+    global_gpu_context.device_result_tiles[stream_index] = NULL;
+    cudaStreamCreate(&global_gpu_context.streams[stream_index]);
+  }
+
+  global_gpu_context.initialized = 1;
 }
 
-void init_matrix_pool()
-{
-    if (g_pool.initialized)
-        return;
+static void cleanup_global_gpu_context() {
+  if (!global_gpu_context.initialized) {
+    return;
+  }
 
-    init_pool_matrix(&g_pool.X_batch, BATCH_SIZE, INPUT_SIZE);
-    init_pool_matrix(&g_pool.Y_batch, BATCH_SIZE, OUTPUT_SIZE);
-    init_pool_matrix(&g_pool.Z1, BATCH_SIZE, HIDDEN_SIZE);
-    init_pool_matrix(&g_pool.Y_pred, BATCH_SIZE, OUTPUT_SIZE);
-    init_pool_matrix(&g_pool.dZ2, BATCH_SIZE, OUTPUT_SIZE);
-    init_pool_matrix(&g_pool.Z1_T, HIDDEN_SIZE, BATCH_SIZE);
-    init_pool_matrix(&g_pool.dW2, HIDDEN_SIZE, OUTPUT_SIZE);
-    init_pool_matrix(&g_pool.W2_T, OUTPUT_SIZE, HIDDEN_SIZE);
-    init_pool_matrix(&g_pool.dZ1, BATCH_SIZE, HIDDEN_SIZE);
-    init_pool_matrix(&g_pool.X_batch_T, INPUT_SIZE, BATCH_SIZE);
+  for (int stream_index = 0; stream_index < STREAM_COUNT; stream_index++) {
+    cudaFree(global_gpu_context.device_left_tiles[stream_index]);
+    cudaFree(global_gpu_context.device_result_tiles[stream_index]);
+    cudaStreamDestroy(global_gpu_context.streams[stream_index]);
+  }
 
-    // Extra buffers (not wrapped in Matrix, used via raw pointer)
-    cudaError_t err;
-    err = cudaMallocHost((void **)&g_pool.dZ1_deriv_data,
-                         BATCH_SIZE * HIDDEN_SIZE * sizeof(float));
-    if (err != cudaSuccess)
-        g_pool.dZ1_deriv_data =
-            (float *)malloc(BATCH_SIZE * HIDDEN_SIZE * sizeof(float));
-
-    err = cudaMallocHost((void **)&g_pool.dW1_data,
-                         INPUT_SIZE * HIDDEN_SIZE * sizeof(float));
-    if (err != cudaSuccess)
-        g_pool.dW1_data =
-            (float *)malloc(INPUT_SIZE * HIDDEN_SIZE * sizeof(float));
-
-    g_pool.initialized = 1;
-    printf("[Pool] Pre-allocated %d reusable matrices + 2 extra buffers\n",
-           NUM_PREALLOCATED);
+  global_gpu_context.initialized = 0;
 }
 
-void cleanup_matrix_pool()
-{
-    if (!g_pool.initialized)
-        return;
+// --- Memory management ---
+static Matrix *allocate_matrix(int row_count, int column_count) {
+  Matrix *matrix = (Matrix *)malloc(sizeof(Matrix));
+  matrix->row_count = row_count;
+  matrix->column_count = column_count;
+  matrix->is_reusable = 0;
+  matrix->uses_pinned_memory = 1;
 
-    free_pool_matrix(&g_pool.X_batch);
-    free_pool_matrix(&g_pool.Y_batch);
-    free_pool_matrix(&g_pool.Z1);
-    free_pool_matrix(&g_pool.Y_pred);
-    free_pool_matrix(&g_pool.dZ2);
-    free_pool_matrix(&g_pool.Z1_T);
-    free_pool_matrix(&g_pool.dW2);
-    free_pool_matrix(&g_pool.W2_T);
-    free_pool_matrix(&g_pool.dZ1);
-    free_pool_matrix(&g_pool.X_batch_T);
+  size_t byte_count = (size_t)row_count * (size_t)column_count * sizeof(float);
+  cudaError_t error = cudaMallocHost((void **)&matrix->data, byte_count);
+  if (error != cudaSuccess) {
+    matrix->data = (float *)malloc(byte_count);
+    matrix->uses_pinned_memory = 0;
+  }
 
-    // Free extra buffers (try pinned first)
-    cudaFreeHost(g_pool.dZ1_deriv_data);
-    cudaFreeHost(g_pool.dW1_data);
-
-    g_pool.initialized = 0;
-    printf("[Pool] Freed all pre-allocated matrices\n");
+  return matrix;
 }
 
-// Resize a pool matrix for a smaller batch (just adjust rows, no realloc)
-void pool_matrix_set_rows(Matrix *m, int rows) { m->rows = rows; }
+static void free_matrix(Matrix *matrix) {
+  if (matrix->is_reusable) {
+    return;
+  }
 
-void ensure_tile_capacity(int A_cols, int B_cols)
-{
-    size_t required_A = TILE_ROWS * A_cols * sizeof(float);
-    size_t required_C = TILE_ROWS * B_cols * sizeof(float);
+  if (matrix->uses_pinned_memory) {
+    cudaFreeHost(matrix->data);
+  } else {
+    free(matrix->data);
+  }
+  free(matrix);
+}
 
-    int needs_realloc = 0;
-
-    // Check if we need larger A tiles
-    if (required_A > g_gpu_ctx.tile_bytes_A)
-    {
-        g_gpu_ctx.tile_bytes_A = required_A;
-        g_gpu_ctx.max_A_cols = A_cols;
-        needs_realloc = 1;
+// --- Matrix operations ---
+static void random_initialize_matrix(Matrix *matrix) {
+  float scale = sqrtf(2.0f / (float)matrix->row_count);
+  for (int row_index = 0; row_index < matrix->row_count; row_index++) {
+    for (int column_index = 0; column_index < matrix->column_count;
+         column_index++) {
+      float random_value = 2.0f * ((float)rand() / (float)RAND_MAX) - 1.0f;
+      matrix->data[row_index * matrix->column_count + column_index] =
+          random_value * scale;
     }
-
-    // Check if we need larger C tiles
-    if (required_C > g_gpu_ctx.tile_bytes_C)
-    {
-        g_gpu_ctx.tile_bytes_C = required_C;
-        g_gpu_ctx.max_B_cols = B_cols;
-        needs_realloc = 1;
-    }
-
-    if (needs_realloc)
-    {
-        // Reallocate tiles for all streams
-        for (int s = 0; s < NUM_STREAMS; s++)
-        {
-            if (g_gpu_ctx.d_A_tiles[s]) cudaFree(g_gpu_ctx.d_A_tiles[s]);
-            if (g_gpu_ctx.d_C_tiles[s]) cudaFree(g_gpu_ctx.d_C_tiles[s]);
-
-            cudaMalloc((void **)&g_gpu_ctx.d_A_tiles[s], g_gpu_ctx.tile_bytes_A);
-            cudaMalloc((void **)&g_gpu_ctx.d_C_tiles[s], g_gpu_ctx.tile_bytes_C);
-        }
-    }
+  }
 }
 
-void init_global_gpu_context()
-{
-    if (g_gpu_ctx.initialized)
-        return;
+// --- CUDA kernels ---
+__global__ void matrix_multiply_kernel(const float *left_matrix,
+                                       const float *right_matrix,
+                                       float *result_matrix, int left_row_count,
+                                       int left_column_count,
+                                       int right_column_count) {
+  int row_index = blockIdx.y * blockDim.y + threadIdx.y;
+  int column_index = blockIdx.x * blockDim.x + threadIdx.x;
 
-    g_gpu_ctx.tile_bytes_A = 0;
-    g_gpu_ctx.tile_bytes_C = 0;
-    g_gpu_ctx.max_A_cols = 0;
-    g_gpu_ctx.max_B_cols = 0;
-
-    for (int s = 0; s < NUM_STREAMS; s++)
-    {
-        g_gpu_ctx.d_A_tiles[s] = NULL;
-        g_gpu_ctx.d_C_tiles[s] = NULL;
-        cudaStreamCreate(&g_gpu_ctx.streams[s]);
+  if (row_index < left_row_count && column_index < right_column_count) {
+    float value = 0.0f;
+    for (int inner_index = 0; inner_index < left_column_count; inner_index++) {
+      value += left_matrix[row_index * left_column_count + inner_index] *
+               right_matrix[inner_index * right_column_count + column_index];
     }
-
-    g_gpu_ctx.initialized = 1;
+    result_matrix[row_index * right_column_count + column_index] = value;
+  }
 }
 
-void cleanup_global_gpu_context()
-{
-    if (!g_gpu_ctx.initialized)
-        return;
+static void matrix_multiply_into(const Matrix *left_matrix,
+                                 const Matrix *right_matrix,
+                                 Matrix *result_matrix) {
+  if (left_matrix->column_count != right_matrix->row_count) {
+    printf("Incompatible matrices for multiplication.\n");
+    exit(1);
+  }
 
-    for (int s = 0; s < NUM_STREAMS; s++)
-    {
-        cudaFree(g_gpu_ctx.d_A_tiles[s]);
-        cudaFree(g_gpu_ctx.d_C_tiles[s]);
-        cudaStreamDestroy(g_gpu_ctx.streams[s]);
-    }
+  result_matrix->row_count = left_matrix->row_count;
+  result_matrix->column_count = right_matrix->column_count;
 
-    g_gpu_ctx.initialized = 0;
+  size_t right_byte_count = (size_t)right_matrix->row_count *
+                            (size_t)right_matrix->column_count * sizeof(float);
+
+  if (!global_gpu_context.initialized) {
+    initialize_global_gpu_context();
+  }
+
+  ensure_tile_capacity(left_matrix->column_count, right_matrix->column_count);
+
+  float *device_right_matrix = NULL;
+  cudaMalloc((void **)&device_right_matrix, right_byte_count);
+  cudaMemcpy(device_right_matrix, right_matrix->data, right_byte_count,
+             cudaMemcpyHostToDevice);
+
+  dim3 threads_per_block(THREADS_PER_BLOCK, THREADS_PER_BLOCK);
+
+  for (int row_start_index = 0, tile_index = 0;
+       row_start_index < left_matrix->row_count;
+       row_start_index += TILE_ROW_COUNT, tile_index++) {
+    int tile_row_count =
+        (row_start_index + TILE_ROW_COUNT <= left_matrix->row_count)
+            ? TILE_ROW_COUNT
+            : (left_matrix->row_count - row_start_index);
+    int stream_index = tile_index % STREAM_COUNT;
+
+    const float *left_tile_host =
+        left_matrix->data + row_start_index * left_matrix->column_count;
+    cudaMemcpyAsync(
+        global_gpu_context.device_left_tiles[stream_index], left_tile_host,
+        (size_t)tile_row_count * (size_t)left_matrix->column_count *
+            sizeof(float),
+        cudaMemcpyHostToDevice, global_gpu_context.streams[stream_index]);
+
+    dim3 blocks_per_grid(
+        (right_matrix->column_count + threads_per_block.x - 1) /
+            threads_per_block.x,
+        (tile_row_count + threads_per_block.y - 1) / threads_per_block.y);
+
+    matrix_multiply_kernel<<<blocks_per_grid, threads_per_block, 0,
+                             global_gpu_context.streams[stream_index]>>>(
+        global_gpu_context.device_left_tiles[stream_index], device_right_matrix,
+        global_gpu_context.device_result_tiles[stream_index], tile_row_count,
+        left_matrix->column_count, right_matrix->column_count);
+
+    float *result_tile_host =
+        result_matrix->data + row_start_index * result_matrix->column_count;
+    cudaMemcpyAsync(
+        result_tile_host, global_gpu_context.device_result_tiles[stream_index],
+        (size_t)tile_row_count * (size_t)right_matrix->column_count *
+            sizeof(float),
+        cudaMemcpyDeviceToHost, global_gpu_context.streams[stream_index]);
+  }
+
+  for (int stream_index = 0; stream_index < STREAM_COUNT; stream_index++) {
+    cudaStreamSynchronize(global_gpu_context.streams[stream_index]);
+  }
+
+  cudaFree(device_right_matrix);
 }
 
-// ! Memory Management
-// Function to allocate a matrix (only used for non-pool matrices: W1, W2, X, Y)
-Matrix *allocate_matrix(int rows, int cols)
-{
-    Matrix *m = (Matrix *)malloc(sizeof(Matrix));
-    m->rows = rows;
-    m->cols = cols;
-    m->reusable = 0;
-    m->pinned = 1;
-    cudaError_t err =
-        cudaMallocHost((void **)&m->data, rows * cols * sizeof(float));
-    if (err != cudaSuccess)
-    {
-        m->data = (float *)malloc(rows * cols * sizeof(float));
-        m->pinned = 0;
+static void matrix_subtract_into(const Matrix *left_matrix,
+                                 const Matrix *right_matrix,
+                                 Matrix *result_matrix) {
+  if (left_matrix->row_count != right_matrix->row_count ||
+      left_matrix->column_count != right_matrix->column_count) {
+    printf("Incompatible matrices for subtraction.\n");
+    exit(1);
+  }
+
+  result_matrix->row_count = left_matrix->row_count;
+  result_matrix->column_count = left_matrix->column_count;
+  for (int row_index = 0; row_index < left_matrix->row_count; row_index++) {
+    for (int column_index = 0; column_index < left_matrix->column_count;
+         column_index++) {
+      int element_index = row_index * left_matrix->column_count + column_index;
+      result_matrix->data[element_index] =
+          left_matrix->data[element_index] - right_matrix->data[element_index];
     }
-    return m;
+  }
 }
 
-// Function to free a matrix (skips pool matrices)
-void free_matrix(Matrix *m)
-{
-    if (m->reusable)
-        return; // Pool matrix — do not free individually
-    if (m->pinned)
-        cudaFreeHost(m->data);
-    else
-        free(m->data);
-    free(m);
+static void matrix_scale_in_place(Matrix *matrix, float scalar) {
+  for (int row_index = 0; row_index < matrix->row_count; row_index++) {
+    for (int column_index = 0; column_index < matrix->column_count;
+         column_index++) {
+      matrix->data[row_index * matrix->column_count + column_index] *= scalar;
+    }
+  }
 }
 
-// ! Matrix Operations
-// Function to initialize matrix with random values
-void random_init(Matrix *m)
-{
-    for (int i = 0; i < m->rows; i++)
-    {
-        for (int j = 0; j < m->cols; j++)
-        {
-            m->data[i * m->cols + j] = (float)rand() / RAND_MAX;
-        }
+static void transpose_into(const Matrix *source_matrix,
+                           Matrix *destination_matrix) {
+  destination_matrix->row_count = source_matrix->column_count;
+  destination_matrix->column_count = source_matrix->row_count;
+
+  for (int row_index = 0; row_index < source_matrix->row_count; row_index++) {
+    for (int column_index = 0; column_index < source_matrix->column_count;
+         column_index++) {
+      destination_matrix
+          ->data[column_index * source_matrix->row_count + row_index] =
+          source_matrix
+              ->data[row_index * source_matrix->column_count + column_index];
     }
+  }
 }
 
-// ! Matrix Operations (GPU version)
-__global__ void mat_mult_kernel(float *A, float *B, float *C, int A_rows,
-                                int A_cols, int B_cols)
-{
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (row < A_rows && col < B_cols)
-    {
-        float value = 0.0f;
-        for (int k = 0; k < A_cols; k++)
-        {
-            value += A[row * A_cols + k] * B[k * B_cols + col];
-        }
-        C[row * B_cols + col] = value;
-    }
-}
-
-// In-place matrix multiply: writes result into pre-allocated C
-void mat_mult_into(Matrix *A, Matrix *B, Matrix *C)
-{
-    if (A->cols != B->rows)
-    {
-        printf("Incompatible matrices for multiplication.\n");
-        exit(1);
-    }
-
-    C->rows = A->rows;
-    C->cols = B->cols;
-
-    size_t sizeB = B->rows * B->cols * sizeof(float);
-
-    // Initialize GPU context on first call
-    if (!g_gpu_ctx.initialized)
-    {
-        init_global_gpu_context();
-    }
-
-    // Ensure tile buffers are large enough for this operation
-    ensure_tile_capacity(A->cols, B->cols);
-
-    // Allocate B for this operation (NO CACHING - prevents stale data bugs)
-    float *d_B;
-    cudaMalloc((void **)&d_B, sizeB);
-    cudaMemcpy(d_B, B->data, sizeB, cudaMemcpyHostToDevice);
-
-    // Tile by rows of A/C with triple buffering and async copies
-    for (int row_start = 0, tile_idx = 0; row_start < A->rows;
-         row_start += TILE_ROWS, tile_idx++)
-    {
-        int tile_rows =
-            (row_start + TILE_ROWS <= A->rows) ? TILE_ROWS : (A->rows - row_start);
-        int s = tile_idx % NUM_STREAMS;
-
-        const float *A_tile_host = A->data + row_start * A->cols;
-        cudaMemcpyAsync(g_gpu_ctx.d_A_tiles[s], A_tile_host,
-                        tile_rows * A->cols * sizeof(float), cudaMemcpyHostToDevice,
-                        g_gpu_ctx.streams[s]);
-
-        dim3 threadsPerBlock(THREADS_PER_BLOCK, THREADS_PER_BLOCK);
-        dim3 numBlocks((B->cols + threadsPerBlock.x - 1) / threadsPerBlock.x,
-                       (tile_rows + threadsPerBlock.y - 1) / threadsPerBlock.y);
-
-        mat_mult_kernel<<<numBlocks, threadsPerBlock, 0, g_gpu_ctx.streams[s]>>>(
-            g_gpu_ctx.d_A_tiles[s], d_B, g_gpu_ctx.d_C_tiles[s],
-            tile_rows, A->cols, B->cols);
-
-        float *C_tile_host = C->data + row_start * C->cols;
-        cudaMemcpyAsync(C_tile_host, g_gpu_ctx.d_C_tiles[s],
-                        tile_rows * B->cols * sizeof(float), cudaMemcpyDeviceToHost,
-                        g_gpu_ctx.streams[s]);
-    }
-
-    // Synchronize all streams
-    for (int s = 0; s < NUM_STREAMS; s++)
-    {
-        cudaStreamSynchronize(g_gpu_ctx.streams[s]);
-    }
-
-    // Free B for this operation
-    cudaFree(d_B);
-}
-
-// In-place matrix subtraction: C = A - B (writes into C)
-void mat_sub_into(Matrix *A, Matrix *B, Matrix *C)
-{
-    if (A->rows != B->rows || A->cols != B->cols)
-    {
-        printf("Incompatible matrices for subtraction.\n");
-        exit(1);
-    }
-    C->rows = A->rows;
-    C->cols = A->cols;
-    for (int i = 0; i < A->rows; i++)
-        for (int j = 0; j < A->cols; j++)
-            C->data[i * A->cols + j] =
-                A->data[i * A->cols + j] - B->data[i * A->cols + j];
-}
-
-// Matrix scalar multiplication: A = A * scalar
-void mat_scalar_mult(Matrix *A, float scalar)
-{
-    for (int i = 0; i < A->rows; i++)
-        for (int j = 0; j < A->cols; j++)
-            A->data[i * A->cols + j] *= scalar;
-}
-
-// In-place transpose: writes transpose of src into dst
-void transpose_into(Matrix *src, Matrix *dst)
-{
-    dst->rows = src->cols;
-    dst->cols = src->rows;
-    for (int i = 0; i < src->rows; i++)
-        for (int j = 0; j < src->cols; j++)
-            dst->data[j * src->rows + i] = src->data[i * src->cols + j];
-}
-
-// ! Activation Functions
+// --- Activation Functions ---
 // Function to apply ReLU activation (in-place)
-void relu(Matrix *m)
-{
-    for (int i = 0; i < m->rows; i++)
-        for (int j = 0; j < m->cols; j++)
-            m->data[i * m->cols + j] = fmaxf(0, m->data[i * m->cols + j]);
+void relu(Matrix *m) {
+  for (int i = 0; i < m->row_count; i++)
+    for (int j = 0; j < m->column_count; j++)
+      m->data[i * m->column_count + j] =
+          fmaxf(0, m->data[i * m->column_count + j]);
 }
 
 // In-place ReLU derivative: writes derivative into out_data buffer
-void relu_derivative_into(Matrix *m, float *out_data)
-{
-    for (int i = 0; i < m->rows; i++)
-        for (int j = 0; j < m->cols; j++)
-            out_data[i * m->cols + j] = (m->data[i * m->cols + j] > 0) ? 1.0f : 0.0f;
+void relu_derivative_into(Matrix *m, float *out_data) {
+  for (int i = 0; i < m->row_count; i++)
+    for (int j = 0; j < m->column_count; j++)
+      out_data[i * m->column_count + j] =
+          (m->data[i * m->column_count + j] > 0) ? 1.0f : 0.0f;
 }
 
-// ! Loss Functions
+// --- Loss Functions ---
 // Function to compute Mean Squared Error
-float mean_squared_error(Matrix *Y_pred, Matrix *Y_true)
-{
-    float mse = 0.0f;
-    for (int i = 0; i < Y_pred->rows; i++)
-        for (int j = 0; j < Y_pred->cols; j++)
-            mse += pow(Y_pred->data[i * Y_pred->cols + j] -
-                           Y_true->data[i * Y_true->cols + j],
-                       2);
-    return mse / Y_pred->rows;
+float mean_squared_error(Matrix *Y_pred, Matrix *Y_true) {
+  float mse = 0.0f;
+  for (int i = 0; i < Y_pred->row_count; i++)
+    for (int j = 0; j < Y_pred->column_count; j++)
+      mse += pow(Y_pred->data[i * Y_pred->column_count + j] -
+                     Y_true->data[i * Y_true->column_count + j],
+                 2);
+  return mse / Y_pred->row_count;
 }
 
-// ! Optimization
+// --- Optimization ---
 // Function to update weights: W = W - learning_rate * grad
-void update_weights(Matrix *W, Matrix *grad, float learning_rate)
-{
-    for (int i = 0; i < W->rows; i++)
-        for (int j = 0; j < W->cols; j++)
-            W->data[i * W->cols + j] -=
-                learning_rate * grad->data[i * grad->cols + j];
+void update_weights(Matrix *W, Matrix *grad, float learning_rate) {
+  for (int i = 0; i < W->row_count; i++)
+    for (int j = 0; j < W->column_count; j++)
+      W->data[i * W->column_count + j] -=
+          learning_rate * grad->data[i * grad->column_count + j];
 }
 
 // Update weights from raw data buffer
 void update_weights_raw(Matrix *W, float *grad_data, int grad_cols,
-                        float learning_rate)
-{
-    for (int i = 0; i < W->rows; i++)
-        for (int j = 0; j < W->cols; j++)
-            W->data[i * W->cols + j] -= learning_rate * grad_data[i * grad_cols + j];
+                        float learning_rate) {
+  for (int i = 0; i < W->row_count; i++)
+    for (int j = 0; j < W->column_count; j++)
+      W->data[i * W->column_count + j] -=
+          learning_rate * grad_data[i * grad_cols + j];
 }
 
-// ! Backpropagation (uses pre-allocated pool matrices)
+// --- Backpropagation ---
 void backpropagation(Matrix *X_batch, Matrix *Y_batch, Matrix *Z1,
-                     Matrix *Y_pred, Matrix *W1, Matrix *W2, int batch_size)
-{
-    // Compute dZ2 = Y_pred - Y_batch (into pool dZ2)
-    mat_sub_into(Y_pred, Y_batch, &g_pool.dZ2);
-    mat_scalar_mult(&g_pool.dZ2, 2.0f / batch_size);
+                     Matrix *Y_pred, Matrix *W1, Matrix *W2, int batch_size) {
+  // Compute dZ2 = Y_pred - Y_batch (into pool dZ2)
+  matrix_subtract_into(Y_pred, Y_batch, &matrix_pool.dZ2);
+  matrix_scale_in_place(&matrix_pool.dZ2, 2.0f / batch_size);
 
-    // Compute Z1^T (into pool Z1_T)
-    transpose_into(Z1, &g_pool.Z1_T);
+  // Compute Z1^T (into pool Z1_T)
+  transpose_into(Z1, &matrix_pool.Z1_T);
 
-    // Compute dW2 = Z1^T * dZ2 (into pool dW2)
-    mat_mult_into(&g_pool.Z1_T, &g_pool.dZ2, &g_pool.dW2);
-    update_weights(W2, &g_pool.dW2, LEARNING_RATE);
+  // Compute dW2 = Z1^T * dZ2 (into pool dW2)
+  matrix_multiply_into(&matrix_pool.Z1_T, &matrix_pool.dZ2, &matrix_pool.dW2);
+  update_weights(W2, &matrix_pool.dW2, LEARNING_RATE);
 
-    // Compute W2^T (into pool W2_T)
-    transpose_into(W2, &g_pool.W2_T);
+  // Compute W2^T (into pool W2_T)
+  transpose_into(W2, &matrix_pool.W2_T);
 
-    // Compute dZ1 = dZ2 * W2^T (into pool dZ1)
-    mat_mult_into(&g_pool.dZ2, &g_pool.W2_T, &g_pool.dZ1);
+  // Compute dZ1 = dZ2 * W2^T (into pool dZ1)
+  matrix_multiply_into(&matrix_pool.dZ2, &matrix_pool.W2_T, &matrix_pool.dZ1);
 
-    // Apply ReLU derivative (into extra buffer)
-    relu_derivative_into(Z1, g_pool.dZ1_deriv_data);
-    for (int i = 0; i < g_pool.dZ1.rows; i++)
-    {
-        for (int j = 0; j < g_pool.dZ1.cols; j++)
-        {
-            g_pool.dZ1.data[i * g_pool.dZ1.cols + j] *=
-                g_pool.dZ1_deriv_data[i * g_pool.dZ1.cols + j];
-        }
+  // Apply ReLU derivative (into extra buffer)
+  relu_derivative_into(Z1, matrix_pool.dZ1_deriv_data);
+  for (int i = 0; i < matrix_pool.dZ1.row_count; i++) {
+    for (int j = 0; j < matrix_pool.dZ1.column_count; j++) {
+      matrix_pool.dZ1.data[i * matrix_pool.dZ1.column_count + j] *=
+          matrix_pool.dZ1_deriv_data[i * matrix_pool.dZ1.column_count + j];
     }
+  }
 
-    // Compute X_batch^T (into pool X_batch_T)
-    transpose_into(X_batch, &g_pool.X_batch_T);
+  // Compute X_batch^T (into pool X_batch_T)
+  transpose_into(X_batch, &matrix_pool.X_batch_T);
 
-    // Compute dW1 = X_batch^T * dZ1 (into extra dW1 buffer via temp Matrix wrapper)
-    Matrix dW1_wrapper;
-    dW1_wrapper.rows = INPUT_SIZE;
-    dW1_wrapper.cols = HIDDEN_SIZE;
-    dW1_wrapper.data = g_pool.dW1_data;
-    dW1_wrapper.pinned = 1;
-    dW1_wrapper.reusable = 1;
-    mat_mult_into(&g_pool.X_batch_T, &g_pool.dZ1, &dW1_wrapper);
-    update_weights_raw(W1, g_pool.dW1_data, HIDDEN_SIZE, LEARNING_RATE);
+  // Compute dW1 = X_batch^T * dZ1 (into extra dW1 buffer via temp Matrix
+  // wrapper)
+  Matrix dW1_wrapper;
+  dW1_wrapper.row_count = INPUT_SIZE;
+  dW1_wrapper.column_count = HIDDEN_SIZE;
+  dW1_wrapper.data = matrix_pool.dW1_data;
+  dW1_wrapper.uses_pinned_memory = 1;
+  dW1_wrapper.is_reusable = 1;
+  matrix_multiply_into(&matrix_pool.X_batch_T, &matrix_pool.dZ1, &dW1_wrapper);
+  update_weights_raw(W1, matrix_pool.dW1_data, HIDDEN_SIZE, LEARNING_RATE);
 }
 
-// ! Batch Processing
+// --- Batch Processing ---
 // Function to get a batch from the dataset (writes into pre-allocated matrices)
 void get_batch(Matrix *X, Matrix *Y, Matrix *X_batch, Matrix *Y_batch,
-               int batch_start, int batch_size)
-{
-    X_batch->rows = batch_size;
-    Y_batch->rows = batch_size;
-    for (int i = 0; i < batch_size; i++)
-    {
-        for (int j = 0; j < INPUT_SIZE; j++)
-            X_batch->data[i * INPUT_SIZE + j] =
-                X->data[(batch_start + i) * INPUT_SIZE + j];
-        Y_batch->data[i * OUTPUT_SIZE] = Y->data[(batch_start + i) * OUTPUT_SIZE];
-    }
+               int batch_start, int batch_size) {
+  X_batch->row_count = batch_size;
+  Y_batch->row_count = batch_size;
+  for (int i = 0; i < batch_size; i++) {
+    for (int j = 0; j < INPUT_SIZE; j++)
+      X_batch->data[i * INPUT_SIZE + j] =
+          X->data[(batch_start + i) * INPUT_SIZE + j];
+    Y_batch->data[i * OUTPUT_SIZE] = Y->data[(batch_start + i) * OUTPUT_SIZE];
+  }
 }
 
-// ! Data Loading
+// --- Data Loading ---
 // Function to load CSV and populate X and Y, Assuming the last column is Y
-int load_csv(const char *filename, Matrix **X, Matrix **Y, int *num_samples)
-{
-    FILE *file = fopen(filename, "r");
-    if (!file)
-    {
-        printf("Failed to open file.\n");
-        return -1;
+int load_csv(const char *filename, Matrix **X, Matrix **Y, int *num_samples) {
+  FILE *file = fopen(filename, "r");
+  if (!file) {
+    printf("Failed to open file.\n");
+    return -1;
+  }
+  char line[1024];
+  int count = 0;
+  // First pass to count samples
+  while (fgets(line, sizeof(line), file))
+    count++;
+  *num_samples = count;
+  rewind(file);
+  // Allocate X and Y
+  *X = allocate_matrix(count, INPUT_SIZE);
+  *Y = allocate_matrix(count, OUTPUT_SIZE);
+  int i = 0;
+  while (fgets(line, sizeof(line), file)) {
+    char *token = strtok(line, ",");
+    int j = 0;
+    while (token) {
+      if (j < INPUT_SIZE) {
+        (*X)->data[i * INPUT_SIZE + j] = atof(token);
+      } else {
+        (*Y)->data[i * OUTPUT_SIZE] = atof(token);
+      }
+      j++;
+      token = strtok(NULL, ",");
     }
-    char line[1024];
-    int count = 0;
-    // First pass to count samples
-    while (fgets(line, sizeof(line), file))
-        count++;
-    *num_samples = count;
-    rewind(file);
-    // Allocate X and Y
-    *X = allocate_matrix(count, INPUT_SIZE);
-    *Y = allocate_matrix(count, OUTPUT_SIZE);
-    int i = 0;
-    while (fgets(line, sizeof(line), file))
-    {
-        char *token = strtok(line, ",");
-        int j = 0;
-        while (token)
-        {
-            if (j < INPUT_SIZE)
-            {
-                (*X)->data[i * INPUT_SIZE + j] = atof(token);
-            }
-            else
-            {
-                (*Y)->data[i * OUTPUT_SIZE] = atof(token);
-            }
-            j++;
-            token = strtok(NULL, ",");
-        }
-        i++;
-    }
-    fclose(file);
-    return 0;
+    i++;
+  }
+  fclose(file);
+  return 0;
 }
 
 // Main function
-int main(int argc, char *argv[])
-{
-    if (argc != 2)
-    {
-        printf("Usage: %s <data.csv>\n", argv[0]);
-        return -1;
+int main(int argc, char *argv[]) {
+  if (argc != 2) {
+    printf("Usage: %s <data.csv>\n", argv[0]);
+    return -1;
+  }
+
+  double start_time, end_time;
+  double total_time = 0.0;
+  float total_final_mse = 0.0f;
+
+  Matrix *X, *Y;
+  int num_samples;
+  if (load_csv(argv[1], &X, &Y, &num_samples) != 0)
+    return -1;
+
+  // Pre-allocate the matrix pool once (10 matrices + 2 extra buffers)
+  initialize_matrix_pool();
+
+  // Run training multiple times
+  for (int run = 0; run < TEST_RUN_COUNT; run++) {
+    // Allocate and initialize weights (these change each run)
+    Matrix *W1 = allocate_matrix(INPUT_SIZE, HIDDEN_SIZE);
+    Matrix *W2 = allocate_matrix(HIDDEN_SIZE, OUTPUT_SIZE);
+    random_initialize_matrix(W1);
+    random_initialize_matrix(W2);
+
+    // Start measuring time
+    start_time = omp_get_wtime();
+
+    float final_mse = 0.0f;
+
+    // Training loop — NO malloc/free inside this loop!
+    for (int epoch = 0; epoch < EPOCHS; epoch++) {
+      for (int batch_start = 0; batch_start < num_samples;
+           batch_start += BATCH_SIZE) {
+        int batch_end = fmin(batch_start + BATCH_SIZE, num_samples);
+        int batch_size = batch_end - batch_start;
+
+        // Extract batch into pre-allocated pool matrices
+        get_batch(X, Y, &matrix_pool.X_batch, &matrix_pool.Y_batch, batch_start,
+                  batch_size);
+
+        // Forward pass: X -> Hidden Layer -> ReLU -> Output Layer
+        matrix_multiply_into(&matrix_pool.X_batch, W1, &matrix_pool.Z1);
+        relu(&matrix_pool.Z1);
+        matrix_multiply_into(&matrix_pool.Z1, W2, &matrix_pool.Y_pred);
+
+        // Compute loss
+        final_mse =
+            mean_squared_error(&matrix_pool.Y_pred, &matrix_pool.Y_batch);
+
+        // Backward pass (all temporaries use pool matrices)
+        backpropagation(&matrix_pool.X_batch, &matrix_pool.Y_batch,
+                        &matrix_pool.Z1, &matrix_pool.Y_pred, W1, W2,
+                        batch_size);
+      }
     }
 
-    double start_time, end_time;
-    double total_time = 0.0;
-    float total_final_mse = 0.0f;
+    // Stop measuring time
+    end_time = omp_get_wtime();
+    total_time += (end_time - start_time);
+    total_final_mse += final_mse;
 
-    Matrix *X, *Y;
-    int num_samples;
-    if (load_csv(argv[1], &X, &Y, &num_samples) != 0)
-        return -1;
+    // Cleanup weights for this run
+    free_matrix(W1);
+    free_matrix(W2);
+  }
 
-    // Pre-allocate the matrix pool once (10 matrices + 2 extra buffers)
-    init_matrix_pool();
+  // Print average training time and MSE
+  printf("Average training time over %d runs: %.4f seconds | Average final "
+         "MSE: %.6f\n",
+         TEST_RUN_COUNT, total_time / TEST_RUN_COUNT,
+         total_final_mse / TEST_RUN_COUNT);
 
-    // Run training multiple times
-    for (int run = 0; run < NUM_TEST_RUNS; run++)
-    {
-        // Allocate and initialize weights (these change each run)
-        Matrix *W1 = allocate_matrix(INPUT_SIZE, HIDDEN_SIZE);
-        Matrix *W2 = allocate_matrix(HIDDEN_SIZE, OUTPUT_SIZE);
-        random_init(W1);
-        random_init(W2);
+  // Cleanup — all at once
+  free_matrix(X);
+  free_matrix(Y);
+  cleanup_matrix_pool();
+  cleanup_global_gpu_context();
 
-        // Start measuring time
-        start_time = omp_get_wtime();
-
-        float final_mse = 0.0f;
-
-        // Training loop — NO malloc/free inside this loop!
-        for (int epoch = 0; epoch < EPOCHS; epoch++)
-        {
-            for (int batch_start = 0; batch_start < num_samples;
-                 batch_start += BATCH_SIZE)
-            {
-                int batch_end = fmin(batch_start + BATCH_SIZE, num_samples);
-                int batch_size = batch_end - batch_start;
-
-                // Extract batch into pre-allocated pool matrices
-                get_batch(X, Y, &g_pool.X_batch, &g_pool.Y_batch, batch_start,
-                          batch_size);
-
-                // Forward pass: X -> Hidden Layer -> ReLU -> Output Layer
-                mat_mult_into(&g_pool.X_batch, W1, &g_pool.Z1);
-                relu(&g_pool.Z1);
-                mat_mult_into(&g_pool.Z1, W2, &g_pool.Y_pred);
-
-                // Compute loss
-                final_mse = mean_squared_error(&g_pool.Y_pred, &g_pool.Y_batch);
-
-                // Backward pass (all temporaries use pool matrices)
-                backpropagation(&g_pool.X_batch, &g_pool.Y_batch, &g_pool.Z1,
-                                &g_pool.Y_pred, W1, W2, batch_size);
-            }
-        }
-
-        // Stop measuring time
-        end_time = omp_get_wtime();
-        total_time += (end_time - start_time);
-        total_final_mse += final_mse;
-
-        // Cleanup weights for this run
-        free_matrix(W1);
-        free_matrix(W2);
-    }
-
-    // Print average training time and MSE
-    printf("Average training time over %d runs: %.4f seconds | Average final MSE: %.6f\n", NUM_TEST_RUNS,
-           total_time / NUM_TEST_RUNS, total_final_mse / NUM_TEST_RUNS);
-
-    // Cleanup — all at once
-    free_matrix(X);
-    free_matrix(Y);
-    cleanup_matrix_pool();
-    cleanup_global_gpu_context();
-
-    return 0;
+  return 0;
 }

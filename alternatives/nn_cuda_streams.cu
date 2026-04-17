@@ -1,4 +1,3 @@
-// Parallel matrix multiplication using CUDA
 #include <cuda_runtime.h>
 #include <math.h>
 #include <omp.h>
@@ -6,395 +5,509 @@
 #include <stdlib.h>
 #include <string.h>
 
-// ! Network Parameters
+// --- Network parameters ---
 #define INPUT_SIZE 32   // Number of input features
 #define HIDDEN_SIZE 256 // Number of neurons in the hidden layer
 #define OUTPUT_SIZE 1   // Number of output neurons
 #define EPOCHS 100      // Number of training epochs
 #define LEARNING_RATE 0.002
-#define BATCH_SIZE 256 // Batch size for SGD
+#define BATCH_SIZE 256 // Batch size for SGD.
 #define THREADS_PER_BLOCK 16
-#define NUM_TEST_RUNS 10 // Number of times to run training for averaging
-#define NUM_STREAMS 3
-#define TILE_ROWS 128
+#define TEST_RUN_COUNT 10 // Number of runs for averaging.
+#define STREAM_COUNT 3
+#define TILE_ROW_COUNT 128
 
-// ! Data Structures
-// Structure for matrix
+// --- Data structures ---
 typedef struct {
-  int rows;
-  int cols;
+  int row_count;
+  int column_count;
   float *data;
 } Matrix;
 
-// ! Memory Management
-// Function to allocate a matrix (contiguous memory allocation)
-Matrix *allocate_matrix(int rows, int cols) {
-  Matrix *m = (Matrix *)malloc(sizeof(Matrix));
-  m->rows = rows;
-  m->cols = cols;
-  // Pinned (page-locked) host memory for async transfers
-  cudaError_t err =
-      cudaMallocHost((void **)&m->data, rows * cols * sizeof(float));
-  if (err != cudaSuccess) {
-    m->data = (float *)malloc(rows * cols * sizeof(float));
+// --- Memory management ---
+static Matrix *allocate_matrix(int row_count, int column_count) {
+  Matrix *matrix = (Matrix *)malloc(sizeof(Matrix));
+  matrix->row_count = row_count;
+  matrix->column_count = column_count;
+
+  size_t byte_count = (size_t)row_count * (size_t)column_count * sizeof(float);
+
+  // Pinned (page-locked) host memory for asynchronous transfers.
+  cudaError_t error = cudaMallocHost((void **)&matrix->data, byte_count);
+  if (error != cudaSuccess) {
+    matrix->data = (float *)malloc(byte_count);
   }
-  return m;
+
+  return matrix;
 }
 
-// Function to free a matrix
-void free_matrix(Matrix *m) {
-  // If allocated with cudaMallocHost, cudaFreeHost is safe; otherwise it is
-  // not. Use a heuristic: attempt cudaFreeHost first, fall back to free on
-  // error.
-  cudaError_t err = cudaFreeHost(m->data);
-  if (err != cudaSuccess) {
-    free(m->data);
+static void free_matrix(Matrix *matrix) {
+  cudaError_t error = cudaFreeHost(matrix->data);
+  if (error != cudaSuccess) {
+    free(matrix->data);
   }
-  free(m);
+  free(matrix);
 }
 
-// ! Matrix Operations
-// Function to initialize matrix with random values using He initialization
-void random_init(Matrix *m) {
-  for (int i = 0; i < m->rows; i++) {
-    for (int j = 0; j < m->cols; j++) {
-      // Initialize with random values between 0 and 1
-      m->data[i * m->cols + j] = (float)rand() / RAND_MAX;
+// --- Matrix operations ---
+static void random_initialize_matrix(Matrix *matrix) {
+  // He initialization: scale by sqrt(2 / fan_in) for ReLU networks.
+  float scale = sqrtf(2.0f / (float)matrix->row_count);
+
+  for (int row_index = 0; row_index < matrix->row_count; row_index++) {
+    for (int column_index = 0; column_index < matrix->column_count;
+         column_index++) {
+      float random_value = 2.0f * ((float)rand() / (float)RAND_MAX) - 1.0f;
+      matrix->data[row_index * matrix->column_count + column_index] =
+          random_value * scale;
     }
   }
 }
 
-// ! Matrix Operations (GPU version)
-__global__ void mat_mult_kernel(float *A, float *B, float *C, int A_rows,
-                                int A_cols, int B_cols) {
-  int row = blockIdx.y * blockDim.y + threadIdx.y;
-  int col = blockIdx.x * blockDim.x + threadIdx.x;
+// --- CUDA kernels ---
+__global__ void matrix_multiply_kernel(const float *left_matrix,
+                                       const float *right_matrix,
+                                       float *result_matrix, int left_row_count,
+                                       int left_column_count,
+                                       int right_column_count) {
+  int row_index = blockIdx.y * blockDim.y + threadIdx.y;
+  int column_index = blockIdx.x * blockDim.x + threadIdx.x;
 
-  if (row < A_rows && col < B_cols) {
+  if (row_index < left_row_count && column_index < right_column_count) {
     float value = 0.0f;
-    for (int k = 0; k < A_cols; k++) {
-      value += A[row * A_cols + k] * B[k * B_cols + col];
+    for (int inner_index = 0; inner_index < left_column_count; inner_index++) {
+      value += left_matrix[row_index * left_column_count + inner_index] *
+               right_matrix[inner_index * right_column_count + column_index];
     }
-    C[row * B_cols + col] = value;
+    result_matrix[row_index * right_column_count + column_index] = value;
   }
 }
 
-// Function to multiply matrices on the GPU
-Matrix *mat_mult(Matrix *A, Matrix *B) {
-  if (A->cols != B->rows) {
+static void check_cuda(cudaError_t error, const char *message) {
+  if (error == cudaSuccess) {
+    return;
+  }
+  fprintf(stderr, "CUDA error (%s): %s\n", message, cudaGetErrorString(error));
+  exit(1);
+}
+
+static Matrix *matrix_multiply(const Matrix *left_matrix,
+                               const Matrix *right_matrix) {
+  if (left_matrix->column_count != right_matrix->row_count) {
     printf("Incompatible matrices for multiplication.\n");
     exit(1);
   }
 
-  Matrix *C = allocate_matrix(A->rows, B->cols);
+  Matrix *result_matrix =
+      allocate_matrix(left_matrix->row_count, right_matrix->column_count);
 
-  size_t sizeB = B->rows * B->cols * sizeof(float);
+  size_t right_byte_count = (size_t)right_matrix->row_count *
+                            (size_t)right_matrix->column_count * sizeof(float);
 
-  // Keep B resident on device (copied once per mat_mult call)
-  float *d_B = NULL;
-  cudaMalloc((void **)&d_B, sizeB);
-  cudaMemcpy(d_B, B->data, sizeB, cudaMemcpyHostToDevice);
+  float *device_right_matrix = NULL;
+  check_cuda(cudaMalloc((void **)&device_right_matrix, right_byte_count),
+             "cudaMalloc(right_matrix)");
+  check_cuda(cudaMemcpy(device_right_matrix, right_matrix->data,
+                        right_byte_count, cudaMemcpyHostToDevice),
+             "cudaMemcpy(right_matrix)");
 
-  // Triple-buffered device tiles for A and C
-  float *d_A_tiles[NUM_STREAMS] = {0};
-  float *d_C_tiles[NUM_STREAMS] = {0};
-  size_t tile_bytes_A = TILE_ROWS * A->cols * sizeof(float);
-  size_t tile_bytes_C = TILE_ROWS * B->cols * sizeof(float);
+  float *device_left_tiles[STREAM_COUNT] = {0};
+  float *device_result_tiles[STREAM_COUNT] = {0};
 
-  for (int s = 0; s < NUM_STREAMS; s++) {
-    cudaMalloc((void **)&d_A_tiles[s], tile_bytes_A);
-    cudaMalloc((void **)&d_C_tiles[s], tile_bytes_C);
+  size_t left_tile_byte_count = (size_t)TILE_ROW_COUNT *
+                                (size_t)left_matrix->column_count *
+                                sizeof(float);
+  size_t result_tile_byte_count = (size_t)TILE_ROW_COUNT *
+                                  (size_t)right_matrix->column_count *
+                                  sizeof(float);
+
+  cudaStream_t streams[STREAM_COUNT];
+  for (int stream_index = 0; stream_index < STREAM_COUNT; stream_index++) {
+    check_cuda(cudaMalloc((void **)&device_left_tiles[stream_index],
+                          left_tile_byte_count),
+               "cudaMalloc(left_tile)");
+    check_cuda(cudaMalloc((void **)&device_result_tiles[stream_index],
+                          result_tile_byte_count),
+               "cudaMalloc(result_tile)");
+    check_cuda(cudaStreamCreate(&streams[stream_index]), "cudaStreamCreate");
   }
 
-  cudaStream_t streams[NUM_STREAMS];
-  for (int s = 0; s < NUM_STREAMS; s++) {
-    cudaStreamCreate(&streams[s]);
+  dim3 threads_per_block(THREADS_PER_BLOCK, THREADS_PER_BLOCK);
+
+  for (int row_start_index = 0, tile_index = 0;
+       row_start_index < left_matrix->row_count;
+       row_start_index += TILE_ROW_COUNT, tile_index++) {
+    int tile_row_count =
+        (row_start_index + TILE_ROW_COUNT <= left_matrix->row_count)
+            ? TILE_ROW_COUNT
+            : (left_matrix->row_count - row_start_index);
+    int stream_index = tile_index % STREAM_COUNT;
+
+    const float *left_tile_host =
+        left_matrix->data + row_start_index * left_matrix->column_count;
+    check_cuda(cudaMemcpyAsync(device_left_tiles[stream_index], left_tile_host,
+                               (size_t)tile_row_count *
+                                   (size_t)left_matrix->column_count *
+                                   sizeof(float),
+                               cudaMemcpyHostToDevice, streams[stream_index]),
+               "cudaMemcpyAsync(left_tile)");
+
+    dim3 blocks_per_grid(
+        (right_matrix->column_count + threads_per_block.x - 1) /
+            threads_per_block.x,
+        (tile_row_count + threads_per_block.y - 1) / threads_per_block.y);
+    matrix_multiply_kernel<<<blocks_per_grid, threads_per_block, 0,
+                             streams[stream_index]>>>(
+        device_left_tiles[stream_index], device_right_matrix,
+        device_result_tiles[stream_index], tile_row_count,
+        left_matrix->column_count, right_matrix->column_count);
+    check_cuda(cudaGetLastError(), "matrix_multiply_kernel launch");
+
+    float *result_tile_host =
+        result_matrix->data + row_start_index * result_matrix->column_count;
+    check_cuda(
+        cudaMemcpyAsync(result_tile_host, device_result_tiles[stream_index],
+                        (size_t)tile_row_count *
+                            (size_t)right_matrix->column_count * sizeof(float),
+                        cudaMemcpyDeviceToHost, streams[stream_index]),
+        "cudaMemcpyAsync(result_tile)");
   }
 
-  // Tile by rows of A/C
-  for (int row_start = 0, tile_idx = 0; row_start < A->rows;
-       row_start += TILE_ROWS, tile_idx++) {
-    int tile_rows =
-        (row_start + TILE_ROWS <= A->rows) ? TILE_ROWS : (A->rows - row_start);
-    int s = tile_idx % NUM_STREAMS;
-
-    // H2D copy for tile of A (async)
-    const float *A_tile_host = A->data + row_start * A->cols;
-    cudaMemcpyAsync(d_A_tiles[s], A_tile_host,
-                    tile_rows * A->cols * sizeof(float), cudaMemcpyHostToDevice,
-                    streams[s]);
-
-    // Kernel on tile
-    dim3 threadsPerBlock(THREADS_PER_BLOCK, THREADS_PER_BLOCK);
-    dim3 numBlocks((B->cols + threadsPerBlock.x - 1) / threadsPerBlock.x,
-                   (tile_rows + threadsPerBlock.y - 1) / threadsPerBlock.y);
-
-    mat_mult_kernel<<<numBlocks, threadsPerBlock, 0, streams[s]>>>(
-        d_A_tiles[s], d_B, d_C_tiles[s], tile_rows, A->cols, B->cols);
-
-    // D2H copy for tile of C (async)
-    float *C_tile_host = C->data + row_start * C->cols;
-    cudaMemcpyAsync(C_tile_host, d_C_tiles[s],
-                    tile_rows * B->cols * sizeof(float), cudaMemcpyDeviceToHost,
-                    streams[s]);
+  for (int stream_index = 0; stream_index < STREAM_COUNT; stream_index++) {
+    check_cuda(cudaStreamSynchronize(streams[stream_index]),
+               "cudaStreamSynchronize");
+    check_cuda(cudaStreamDestroy(streams[stream_index]), "cudaStreamDestroy");
+    cudaFree(device_left_tiles[stream_index]);
+    cudaFree(device_result_tiles[stream_index]);
   }
 
-  // Ensure all queued work completes
-  for (int s = 0; s < NUM_STREAMS; s++) {
-    cudaStreamSynchronize(streams[s]);
-    cudaStreamDestroy(streams[s]);
-    cudaFree(d_A_tiles[s]);
-    cudaFree(d_C_tiles[s]);
-  }
+  cudaFree(device_right_matrix);
 
-  cudaFree(d_B);
-
-  return C;
+  return result_matrix;
 }
 
-// Matrix subtraction: C = A - B
-Matrix *mat_sub(Matrix *A, Matrix *B) {
-  if (A->rows != B->rows || A->cols != B->cols) {
+static Matrix *matrix_subtract(const Matrix *left_matrix,
+                               const Matrix *right_matrix) {
+  if (left_matrix->row_count != right_matrix->row_count ||
+      left_matrix->column_count != right_matrix->column_count) {
     printf("Incompatible matrices for subtraction.\n");
     exit(1);
   }
-  Matrix *C = allocate_matrix(A->rows, A->cols);
-  for (int i = 0; i < A->rows; i++)
-    for (int j = 0; j < A->cols; j++)
-      C->data[i * A->cols + j] =
-          A->data[i * A->cols + j] - B->data[i * A->cols + j];
-  return C;
+
+  Matrix *result_matrix =
+      allocate_matrix(left_matrix->row_count, left_matrix->column_count);
+  for (int row_index = 0; row_index < left_matrix->row_count; row_index++) {
+    for (int column_index = 0; column_index < left_matrix->column_count;
+         column_index++) {
+      int element_index = row_index * left_matrix->column_count + column_index;
+      result_matrix->data[element_index] =
+          left_matrix->data[element_index] - right_matrix->data[element_index];
+    }
+  }
+
+  return result_matrix;
 }
 
-// Matrix scalar multiplication: A = A * scalar
-void mat_scalar_mult(Matrix *A, float scalar) {
-  for (int i = 0; i < A->rows; i++)
-    for (int j = 0; j < A->cols; j++)
-      A->data[i * A->cols + j] *= scalar;
+static void matrix_scale_in_place(Matrix *matrix, float scalar) {
+  for (int row_index = 0; row_index < matrix->row_count; row_index++) {
+    for (int column_index = 0; column_index < matrix->column_count;
+         column_index++) {
+      matrix->data[row_index * matrix->column_count + column_index] *= scalar;
+    }
+  }
 }
 
-// ! Activation Functions
-// Function to apply ReLU activation
-void relu(Matrix *m) {
-  for (int i = 0; i < m->rows; i++)
-    for (int j = 0; j < m->cols; j++)
-      m->data[i * m->cols + j] = fmaxf(0, m->data[i * m->cols + j]);
+// --- Activation functions ---
+static void apply_relu_in_place(Matrix *matrix) {
+  for (int row_index = 0; row_index < matrix->row_count; row_index++) {
+    for (int column_index = 0; column_index < matrix->column_count;
+         column_index++) {
+      int element_index = row_index * matrix->column_count + column_index;
+      matrix->data[element_index] = fmaxf(0.0f, matrix->data[element_index]);
+    }
+  }
 }
 
-// Function to compute derivative of ReLU
-Matrix *relu_derivative(Matrix *m) {
-  Matrix *derivative = allocate_matrix(m->rows, m->cols);
-  for (int i = 0; i < m->rows; i++)
-    for (int j = 0; j < m->cols; j++)
-      derivative->data[i * m->cols + j] =
-          (m->data[i * m->cols + j] > 0) ? 1 : 0;
+static Matrix *compute_relu_derivative(const Matrix *matrix) {
+  Matrix *derivative = allocate_matrix(matrix->row_count, matrix->column_count);
+  for (int row_index = 0; row_index < matrix->row_count; row_index++) {
+    for (int column_index = 0; column_index < matrix->column_count;
+         column_index++) {
+      int element_index = row_index * matrix->column_count + column_index;
+      derivative->data[element_index] =
+          (matrix->data[element_index] > 0.0f) ? 1.0f : 0.0f;
+    }
+  }
   return derivative;
 }
 
-// ! Loss Functions
-// Function to compute Mean Squared Error
-float mean_squared_error(Matrix *Y_pred, Matrix *Y_true) {
-  float mse = 0.0f;
-  for (int i = 0; i < Y_pred->rows; i++)
-    for (int j = 0; j < Y_pred->cols; j++)
-      mse += pow(Y_pred->data[i * Y_pred->cols + j] -
-                     Y_true->data[i * Y_true->cols + j],
-                 2);
-  return mse / Y_pred->rows;
+// --- Loss functions ---
+static float compute_mean_squared_error(const Matrix *predicted_output,
+                                        const Matrix *expected_output) {
+  float mean_squared_error = 0.0f;
+  for (int row_index = 0; row_index < predicted_output->row_count;
+       row_index++) {
+    for (int column_index = 0; column_index < predicted_output->column_count;
+         column_index++) {
+      int element_index =
+          row_index * predicted_output->column_count + column_index;
+      float error = predicted_output->data[element_index] -
+                    expected_output->data[element_index];
+      mean_squared_error += error * error;
+    }
+  }
+  return mean_squared_error / (float)predicted_output->row_count;
 }
 
-// ! Optimization
-// Function to update weights: W = W - learning_rate * grad
-void update_weights(Matrix *W, Matrix *grad, float learning_rate) {
-  for (int i = 0; i < W->rows; i++)
-    for (int j = 0; j < W->cols; j++)
-      W->data[i * W->cols + j] -=
-          learning_rate * grad->data[i * grad->cols + j];
-}
-
-// Function to perform backpropagation and update weights
-void backpropagation(Matrix *X_batch, Matrix *Y_batch, Matrix *Z1,
-                     Matrix *Y_pred, Matrix *W1, Matrix *W2, int batch_size) {
-  // Compute dZ2 = Y_pred - Y_batch
-  Matrix *dZ2 = mat_sub(Y_pred, Y_batch);
-  mat_scalar_mult(dZ2, 2.0f / batch_size);
-
-  // Compute dW2 = Z1^T * dZ2
-  Matrix *Z1_T = allocate_matrix(Z1->cols, Z1->rows);
-  for (int i = 0; i < Z1->rows; i++) {
-    for (int j = 0; j < Z1->cols; j++) {
-      Z1_T->data[j * Z1->rows + i] = Z1->data[i * Z1->cols + j];
+// --- Optimization ---
+static void apply_gradient_descent_update(Matrix *weights,
+                                          const Matrix *gradient,
+                                          float learning_rate) {
+  for (int row_index = 0; row_index < weights->row_count; row_index++) {
+    for (int column_index = 0; column_index < weights->column_count;
+         column_index++) {
+      int element_index = row_index * weights->column_count + column_index;
+      weights->data[element_index] -=
+          learning_rate * gradient->data[element_index];
     }
-  }
-  Matrix *dW2 = mat_mult(Z1_T, dZ2);
-  update_weights(W2, dW2, LEARNING_RATE);
-  free_matrix(dW2);
-  free_matrix(Z1_T);
-
-  // Compute dZ1 = dZ2 * W2^T
-  Matrix *W2_T = allocate_matrix(W2->cols, W2->rows);
-  for (int i = 0; i < W2->rows; i++) {
-    for (int j = 0; j < W2->cols; j++) {
-      W2_T->data[j * W2->rows + i] = W2->data[i * W2->cols + j];
-    }
-  }
-  Matrix *dZ1 = mat_mult(dZ2, W2_T);
-
-  // Apply ReLU derivative
-  Matrix *dZ1_derivative = relu_derivative(Z1);
-  for (int i = 0; i < dZ1->rows; i++) {
-    for (int j = 0; j < dZ1->cols; j++) {
-      dZ1->data[i * dZ1->cols + j] *=
-          dZ1_derivative->data[i * dZ1_derivative->cols + j];
-    }
-  }
-  free_matrix(dZ1_derivative);
-  free_matrix(W2_T);
-
-  // Compute dW1 = X_batch^T * dZ1
-  Matrix *X_batch_T = allocate_matrix(X_batch->cols, X_batch->rows);
-  for (int i = 0; i < X_batch->rows; i++) {
-    for (int j = 0; j < X_batch->cols; j++) {
-      X_batch_T->data[j * X_batch->rows + i] =
-          X_batch->data[i * X_batch->cols + j];
-    }
-  }
-  Matrix *dW1 = mat_mult(X_batch_T, dZ1);
-  update_weights(W1, dW1, LEARNING_RATE);
-  free_matrix(dW1);
-  free_matrix(X_batch_T);
-
-  // Free allocated matrices
-  free_matrix(dZ2);
-  free_matrix(dZ1);
-}
-
-// ! Batch Processing
-// Function to get a batch from the dataset
-void get_batch(Matrix *X, Matrix *Y, Matrix *X_batch, Matrix *Y_batch,
-               int batch_start, int batch_size) {
-  for (int i = 0; i < batch_size; i++) {
-    for (int j = 0; j < INPUT_SIZE; j++)
-      X_batch->data[i * INPUT_SIZE + j] =
-          X->data[(batch_start + i) * INPUT_SIZE + j];
-    Y_batch->data[i * OUTPUT_SIZE] = Y->data[(batch_start + i) * OUTPUT_SIZE];
   }
 }
 
-// ! Data Loading
-// Function to load CSV and populate X and Y, Assuming the last column is Y
-int load_csv(const char *filename, Matrix **X, Matrix **Y, int *num_samples) {
+static void backpropagate_and_update_weights(const Matrix *input_batch,
+                                             const Matrix *target_batch,
+                                             const Matrix *hidden_layer_output,
+                                             const Matrix *predicted_output,
+                                             Matrix *weights_input_to_hidden,
+                                             Matrix *weights_hidden_to_output,
+                                             int batch_size) {
+  Matrix *output_error = matrix_subtract(predicted_output, target_batch);
+  matrix_scale_in_place(output_error, 2.0f / (float)batch_size);
+
+  Matrix *hidden_layer_output_transpose = allocate_matrix(
+      hidden_layer_output->column_count, hidden_layer_output->row_count);
+  for (int row_index = 0; row_index < hidden_layer_output->row_count;
+       row_index++) {
+    for (int column_index = 0; column_index < hidden_layer_output->column_count;
+         column_index++) {
+      hidden_layer_output_transpose
+          ->data[column_index * hidden_layer_output->row_count + row_index] =
+          hidden_layer_output
+              ->data[row_index * hidden_layer_output->column_count +
+                     column_index];
+    }
+  }
+
+  Matrix *weights_hidden_to_output_gradient =
+      matrix_multiply(hidden_layer_output_transpose, output_error);
+  apply_gradient_descent_update(weights_hidden_to_output,
+                                weights_hidden_to_output_gradient,
+                                LEARNING_RATE);
+  free_matrix(weights_hidden_to_output_gradient);
+  free_matrix(hidden_layer_output_transpose);
+
+  Matrix *weights_hidden_to_output_transpose =
+      allocate_matrix(weights_hidden_to_output->column_count,
+                      weights_hidden_to_output->row_count);
+  for (int row_index = 0; row_index < weights_hidden_to_output->row_count;
+       row_index++) {
+    for (int column_index = 0;
+         column_index < weights_hidden_to_output->column_count;
+         column_index++) {
+      weights_hidden_to_output_transpose
+          ->data[column_index * weights_hidden_to_output->row_count +
+                 row_index] =
+          weights_hidden_to_output
+              ->data[row_index * weights_hidden_to_output->column_count +
+                     column_index];
+    }
+  }
+
+  Matrix *hidden_layer_error =
+      matrix_multiply(output_error, weights_hidden_to_output_transpose);
+
+  Matrix *relu_derivative_matrix = compute_relu_derivative(hidden_layer_output);
+  for (int row_index = 0; row_index < hidden_layer_error->row_count;
+       row_index++) {
+    for (int column_index = 0; column_index < hidden_layer_error->column_count;
+         column_index++) {
+      int element_index =
+          row_index * hidden_layer_error->column_count + column_index;
+      hidden_layer_error->data[element_index] *=
+          relu_derivative_matrix->data[element_index];
+    }
+  }
+
+  free_matrix(relu_derivative_matrix);
+  free_matrix(weights_hidden_to_output_transpose);
+
+  Matrix *input_batch_transpose =
+      allocate_matrix(input_batch->column_count, input_batch->row_count);
+  for (int row_index = 0; row_index < input_batch->row_count; row_index++) {
+    for (int column_index = 0; column_index < input_batch->column_count;
+         column_index++) {
+      input_batch_transpose
+          ->data[column_index * input_batch->row_count + row_index] =
+          input_batch
+              ->data[row_index * input_batch->column_count + column_index];
+    }
+  }
+
+  Matrix *weights_input_to_hidden_gradient =
+      matrix_multiply(input_batch_transpose, hidden_layer_error);
+  apply_gradient_descent_update(
+      weights_input_to_hidden, weights_input_to_hidden_gradient, LEARNING_RATE);
+  free_matrix(weights_input_to_hidden_gradient);
+  free_matrix(input_batch_transpose);
+
+  free_matrix(output_error);
+  free_matrix(hidden_layer_error);
+}
+
+// --- Dataset utilities ---
+static void copy_mini_batch(const Matrix *input_dataset,
+                            const Matrix *target_dataset, Matrix *input_batch,
+                            Matrix *target_batch, int start_index,
+                            int batch_size) {
+  for (int batch_index = 0; batch_index < batch_size; batch_index++) {
+    for (int feature_index = 0; feature_index < INPUT_SIZE; feature_index++) {
+      input_batch
+          ->data[batch_index * input_batch->column_count + feature_index] =
+          input_dataset
+              ->data[(start_index + batch_index) * input_dataset->column_count +
+                     feature_index];
+    }
+    target_batch->data[batch_index * target_batch->column_count] =
+        target_dataset
+            ->data[(start_index + batch_index) * target_dataset->column_count];
+  }
+}
+
+static int load_dataset_from_csv(const char *filename, Matrix **input_dataset,
+                                 Matrix **target_dataset,
+                                 int *number_of_samples) {
   FILE *file = fopen(filename, "r");
-  if (!file) {
-    printf("Failed to open file.\n");
+  if (file == NULL) {
+    printf("Failed to open file: %s\n", filename);
     return -1;
   }
-  char line[1024];
-  int count = 0;
-  // First pass to count samples
-  while (fgets(line, sizeof(line), file))
-    count++;
-  *num_samples = count;
+
+  char line_buffer[1024];
+  int sample_count = 0;
+  while (fgets(line_buffer, sizeof(line_buffer), file) != NULL) {
+    sample_count++;
+  }
+
+  *number_of_samples = sample_count;
   rewind(file);
-  // Allocate X and Y
-  *X = allocate_matrix(count, INPUT_SIZE);
-  *Y = allocate_matrix(count, OUTPUT_SIZE);
-  int i = 0;
-  while (fgets(line, sizeof(line), file)) {
-    char *token = strtok(line, ",");
-    int j = 0;
-    while (token) {
-      if (j < INPUT_SIZE) {
-        (*X)->data[i * INPUT_SIZE + j] = atof(token);
+
+  *input_dataset = allocate_matrix(sample_count, INPUT_SIZE);
+  *target_dataset = allocate_matrix(sample_count, OUTPUT_SIZE);
+
+  for (int sample_index = 0;
+       sample_index < sample_count &&
+       fgets(line_buffer, sizeof(line_buffer), file) != NULL;
+       sample_index++) {
+    char *token = strtok(line_buffer, ",");
+    int feature_index = 0;
+
+    while (token != NULL) {
+      if (feature_index < INPUT_SIZE) {
+        (*input_dataset)
+            ->data[sample_index * (*input_dataset)->column_count +
+                   feature_index] = atof(token);
       } else {
-        (*Y)->data[i * OUTPUT_SIZE] = atof(token);
+        (*target_dataset)
+            ->data[sample_index * (*target_dataset)->column_count] =
+            atof(token);
       }
-      j++;
+      feature_index++;
       token = strtok(NULL, ",");
     }
-    i++;
   }
   fclose(file);
   return 0;
 }
 
-// Main function
 int main(int argc, char *argv[]) {
   if (argc != 2) {
     printf("Usage: %s <data.csv>\n", argv[0]);
     return -1;
   }
 
-  double start_time, end_time;
+  double start_time;
+  double end_time;
   double total_time = 0.0;
   float total_final_mse = 0.0f;
 
-  Matrix *X, *Y;
-  int num_samples;
-  if (load_csv(argv[1], &X, &Y, &num_samples) != 0)
+  Matrix *input_dataset = NULL;
+  Matrix *target_dataset = NULL;
+  int number_of_samples = 0;
+
+  if (load_dataset_from_csv(argv[1], &input_dataset, &target_dataset,
+                            &number_of_samples) != 0) {
     return -1;
+  }
 
-  // Run training multiple times
-  for (int run = 0; run < NUM_TEST_RUNS; run++) {
-    // Allocate and initialize weights
-    Matrix *W1 = allocate_matrix(INPUT_SIZE, HIDDEN_SIZE);
-    Matrix *W2 = allocate_matrix(HIDDEN_SIZE, OUTPUT_SIZE);
-    random_init(W1);
-    random_init(W2);
+  for (int run_index = 0; run_index < TEST_RUN_COUNT; run_index++) {
+    Matrix *weights_input_to_hidden = allocate_matrix(INPUT_SIZE, HIDDEN_SIZE);
+    Matrix *weights_hidden_to_output =
+        allocate_matrix(HIDDEN_SIZE, OUTPUT_SIZE);
+    random_initialize_matrix(weights_input_to_hidden);
+    random_initialize_matrix(weights_hidden_to_output);
 
-    // Start measuring time
     start_time = omp_get_wtime();
 
     float final_mse = 0.0f;
 
-    // Training loop
-    for (int epoch = 0; epoch < EPOCHS; epoch++) {
-      for (int batch_start = 0; batch_start < num_samples;
-           batch_start += BATCH_SIZE) {
-        int batch_end = fmin(batch_start + BATCH_SIZE, num_samples);
-        int batch_size = batch_end - batch_start;
+    for (int epoch_index = 0; epoch_index < EPOCHS; epoch_index++) {
+      for (int batch_start_index = 0; batch_start_index < number_of_samples;
+           batch_start_index += BATCH_SIZE) {
+        int batch_end_index = batch_start_index + BATCH_SIZE;
+        if (batch_end_index > number_of_samples) {
+          batch_end_index = number_of_samples;
+        }
 
-        // Extract batch
-        Matrix *X_batch = allocate_matrix(batch_size, INPUT_SIZE);
-        Matrix *Y_batch = allocate_matrix(batch_size, OUTPUT_SIZE);
-        get_batch(X, Y, X_batch, Y_batch, batch_start, batch_size);
+        int batch_size = batch_end_index - batch_start_index;
 
-        // Forward pass: X -> Hidden Layer -> ReLU -> Output Layer
-        Matrix *Z1 = mat_mult(X_batch, W1);
-        relu(Z1);
-        Matrix *Y_pred = mat_mult(Z1, W2);
+        Matrix *input_batch = allocate_matrix(batch_size, INPUT_SIZE);
+        Matrix *target_batch = allocate_matrix(batch_size, OUTPUT_SIZE);
+        copy_mini_batch(input_dataset, target_dataset, input_batch,
+                        target_batch, batch_start_index, batch_size);
 
-        // Compute loss
-        final_mse = mean_squared_error(Y_pred, Y_batch);
+        Matrix *hidden_layer_output =
+            matrix_multiply(input_batch, weights_input_to_hidden);
+        apply_relu_in_place(hidden_layer_output);
+        Matrix *predicted_output =
+            matrix_multiply(hidden_layer_output, weights_hidden_to_output);
 
-        // Backward pass
-        backpropagation(X_batch, Y_batch, Z1, Y_pred, W1, W2, batch_size);
+        final_mse = compute_mean_squared_error(predicted_output, target_batch);
 
-        // Free allocated matrices
-        free_matrix(Z1);
-        free_matrix(Y_pred);
-        free_matrix(X_batch);
-        free_matrix(Y_batch);
+        backpropagate_and_update_weights(
+            input_batch, target_batch, hidden_layer_output, predicted_output,
+            weights_input_to_hidden, weights_hidden_to_output, batch_size);
+
+        free_matrix(hidden_layer_output);
+        free_matrix(predicted_output);
+        free_matrix(input_batch);
+        free_matrix(target_batch);
       }
     }
 
-    // Stop measuring time
     end_time = omp_get_wtime();
     total_time += (end_time - start_time);
     total_final_mse += final_mse;
 
-    // Cleanup weights for this run
-    free_matrix(W1);
-    free_matrix(W2);
+    free_matrix(weights_input_to_hidden);
+    free_matrix(weights_hidden_to_output);
   }
 
-  // Print average training time and MSE
-  printf("Average training time over %d runs: %.4f seconds | Average final MSE: %.6f\n", NUM_TEST_RUNS,
-         total_time / NUM_TEST_RUNS, total_final_mse / NUM_TEST_RUNS);
+  printf("Average training time over %d runs: %.4f seconds | Average final "
+         "MSE: %.6f\n",
+         TEST_RUN_COUNT, total_time / TEST_RUN_COUNT,
+         total_final_mse / TEST_RUN_COUNT);
 
-  // Cleanup data
-  free_matrix(X);
-  free_matrix(Y);
+  free_matrix(input_dataset);
+  free_matrix(target_dataset);
 
   return 0;
 }

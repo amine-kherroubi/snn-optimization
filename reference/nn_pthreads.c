@@ -5,336 +5,423 @@
 #include <stdlib.h>
 #include <string.h>
 
-// ! Network Parameters
+// --- Network parameters ---
 #define INPUT_SIZE 32     // Number of input features
 #define HIDDEN_SIZE 256   // Number of neurons in the hidden layer
 #define OUTPUT_SIZE 1     // Number of output neurons
 #define EPOCHS 100        // Number of training epochs
 #define LOG_EVERY_EPOCH 1 // Log loss every n epochs
 #define LEARNING_RATE 0.002
-#define BATCH_SIZE 256 // Batch size for SGD
-#define NUM_THREADS 4  // Number of threads for parallelization
+#define BATCH_SIZE 256 // Batch size for SGD.
+#define THREAD_COUNT 4 // Number of threads for parallelization.
 
-// ! Data Structures
-// Structure for matrix
+// --- Data structures ---
 typedef struct {
-  int rows;
-  int cols;
+  int row_count;
+  int column_count;
   float **data;
 } Matrix;
 
-// Structure for passing data to threads
 typedef struct {
-  Matrix *A;
-  Matrix *B;
-  Matrix *C;
-  int start_row;
-  int end_row;
-} ThreadData;
+  const Matrix *left_matrix;
+  const Matrix *right_matrix;
+  Matrix *result_matrix;
+  int start_row_index;
+  int end_row_index;
+} MatrixMultiplyThreadData;
 
-// ! Memory Management
-// Function to allocate a matrix
-Matrix *allocate_matrix(int rows, int cols) {
-  Matrix *m = (Matrix *)malloc(sizeof(Matrix));
-  m->rows = rows;
-  m->cols = cols;
-  m->data = (float **)malloc(rows * sizeof(float *));
-  for (int i = 0; i < rows; i++)
-    m->data[i] = (float *)calloc(cols, sizeof(float));
-  return m;
+// --- Memory management ---
+static Matrix *allocate_matrix(int row_count, int column_count) {
+  Matrix *matrix = (Matrix *)malloc(sizeof(Matrix));
+  matrix->row_count = row_count;
+  matrix->column_count = column_count;
+  matrix->data = (float **)malloc((size_t)row_count * sizeof(float *));
+
+  for (int row_index = 0; row_index < row_count; row_index++) {
+    matrix->data[row_index] =
+        (float *)calloc((size_t)column_count, sizeof(float));
+  }
+
+  return matrix;
 }
 
-// Function to free a matrix
-void free_matrix(Matrix *m) {
-  for (int i = 0; i < m->rows; i++)
-    free(m->data[i]);
-  free(m->data);
-  free(m);
+static void free_matrix(Matrix *matrix) {
+  for (int row_index = 0; row_index < matrix->row_count; row_index++) {
+    free(matrix->data[row_index]);
+  }
+  free(matrix->data);
+  free(matrix);
 }
 
-// ! Matrix Operations
-// Function to initialize matrix with random values using He initialization
-void random_init(Matrix *m) {
-  float stddev = sqrt(2.0 / m->cols);
-  for (int i = 0; i < m->rows; i++)
-    for (int j = 0; j < m->cols; j++)
-      m->data[i][j] = (float)rand() / RAND_MAX;
-}
+// --- Matrix operations ---
+static void random_initialize_matrix(Matrix *matrix) {
+  // He initialization: scale by sqrt(2 / fan_in) for ReLU networks.
+  float scale = sqrtf(2.0f / (float)matrix->row_count);
 
-// Thread function for matrix multiplication
-void *mat_mult_thread(void *arg) {
-  ThreadData *data = (ThreadData *)arg;
-  Matrix *A = data->A;
-  Matrix *B = data->B;
-  Matrix *C = data->C;
-  int start_row = data->start_row;
-  int end_row = data->end_row;
-
-  for (int i = start_row; i < end_row; i++) {
-    for (int j = 0; j < B->cols; j++) {
-      C->data[i][j] = 0; // Initialize to zero
-      for (int k = 0; k < A->cols; k++) {
-        C->data[i][j] += A->data[i][k] * B->data[k][j];
-      }
+  for (int row_index = 0; row_index < matrix->row_count; row_index++) {
+    for (int column_index = 0; column_index < matrix->column_count;
+         column_index++) {
+      float random_value = 2.0f * ((float)rand() / (float)RAND_MAX) - 1.0f;
+      matrix->data[row_index][column_index] = random_value * scale;
     }
   }
+}
+
+static void *matrix_multiply_thread(void *argument) {
+  MatrixMultiplyThreadData *thread_data = (MatrixMultiplyThreadData *)argument;
+  const Matrix *left_matrix = thread_data->left_matrix;
+  const Matrix *right_matrix = thread_data->right_matrix;
+  Matrix *result_matrix = thread_data->result_matrix;
+
+  for (int row_index = thread_data->start_row_index;
+       row_index < thread_data->end_row_index; row_index++) {
+    for (int column_index = 0; column_index < right_matrix->column_count;
+         column_index++) {
+      float sum = 0.0f;
+
+      for (int inner_index = 0; inner_index < left_matrix->column_count;
+           inner_index++) {
+        sum += left_matrix->data[row_index][inner_index] *
+               right_matrix->data[inner_index][column_index];
+      }
+
+      result_matrix->data[row_index][column_index] = sum;
+    }
+  }
+
   return NULL;
 }
 
-// Parallel matrix multiplication using pthreads
-Matrix *mat_mult(Matrix *A, Matrix *B) {
-  if (A->cols != B->rows) {
+static Matrix *matrix_multiply(const Matrix *left_matrix,
+                               const Matrix *right_matrix) {
+  if (left_matrix->column_count != right_matrix->row_count) {
     printf("Incompatible matrices for multiplication.\n");
     exit(1);
   }
-  Matrix *C = allocate_matrix(A->rows, B->cols);
+  Matrix *result_matrix =
+      allocate_matrix(left_matrix->row_count, right_matrix->column_count);
 
-  pthread_t threads[NUM_THREADS];
-  ThreadData thread_data[NUM_THREADS];
-  int rows_per_thread = A->rows / NUM_THREADS;
+  pthread_t threads[THREAD_COUNT];
+  MatrixMultiplyThreadData thread_data[THREAD_COUNT];
+  int rows_per_thread = left_matrix->row_count / THREAD_COUNT;
 
-  // Create threads
-  for (int t = 0; t < NUM_THREADS; t++) {
-    thread_data[t].A = A;
-    thread_data[t].B = B;
-    thread_data[t].C = C;
-    thread_data[t].start_row = t * rows_per_thread;
-    thread_data[t].end_row =
-        (t == NUM_THREADS - 1) ? A->rows : (t + 1) * rows_per_thread;
-    pthread_create(&threads[t], NULL, mat_mult_thread, &thread_data[t]);
+  for (int thread_index = 0; thread_index < THREAD_COUNT; thread_index++) {
+    thread_data[thread_index].left_matrix = left_matrix;
+    thread_data[thread_index].right_matrix = right_matrix;
+    thread_data[thread_index].result_matrix = result_matrix;
+    thread_data[thread_index].start_row_index = thread_index * rows_per_thread;
+    thread_data[thread_index].end_row_index =
+        (thread_index == THREAD_COUNT - 1)
+            ? left_matrix->row_count
+            : (thread_index + 1) * rows_per_thread;
+    pthread_create(&threads[thread_index], NULL, matrix_multiply_thread,
+                   &thread_data[thread_index]);
   }
 
-  // Join threads
-  for (int t = 0; t < NUM_THREADS; t++) {
-    pthread_join(threads[t], NULL);
+  for (int thread_index = 0; thread_index < THREAD_COUNT; thread_index++) {
+    pthread_join(threads[thread_index], NULL);
   }
 
-  return C;
+  return result_matrix;
 }
 
-// Matrix subtraction: C = A - B
-Matrix *mat_sub(Matrix *A, Matrix *B) {
-  if (A->rows != B->rows || A->cols != B->cols) {
+static Matrix *matrix_subtract(const Matrix *left_matrix,
+                               const Matrix *right_matrix) {
+  if (left_matrix->row_count != right_matrix->row_count ||
+      left_matrix->column_count != right_matrix->column_count) {
     printf("Incompatible matrices for subtraction.\n");
     exit(1);
   }
-  Matrix *C = allocate_matrix(A->rows, A->cols);
-  for (int i = 0; i < A->rows; i++)
-    for (int j = 0; j < A->cols; j++)
-      C->data[i][j] = A->data[i][j] - B->data[i][j];
-  return C;
+
+  Matrix *result_matrix =
+      allocate_matrix(left_matrix->row_count, left_matrix->column_count);
+  for (int row_index = 0; row_index < left_matrix->row_count; row_index++) {
+    for (int column_index = 0; column_index < left_matrix->column_count;
+         column_index++) {
+      result_matrix->data[row_index][column_index] =
+          left_matrix->data[row_index][column_index] -
+          right_matrix->data[row_index][column_index];
+    }
+  }
+
+  return result_matrix;
 }
 
-// Matrix scalar multiplication: A = A * scalar
-void mat_scalar_mult(Matrix *A, float scalar) {
-  for (int i = 0; i < A->rows; i++)
-    for (int j = 0; j < A->cols; j++)
-      A->data[i][j] *= scalar;
+static void matrix_scale_in_place(Matrix *matrix, float scalar) {
+  for (int row_index = 0; row_index < matrix->row_count; row_index++) {
+    for (int column_index = 0; column_index < matrix->column_count;
+         column_index++) {
+      matrix->data[row_index][column_index] *= scalar;
+    }
+  }
 }
 
-// ! Activation Functions
-// Function to apply ReLU activation
-void relu(Matrix *m) {
-  for (int i = 0; i < m->rows; i++)
-    for (int j = 0; j < m->cols; j++)
-      m->data[i][j] = fmaxf(0, m->data[i][j]);
+// --- Activation functions ---
+static void apply_relu_in_place(Matrix *matrix) {
+  for (int row_index = 0; row_index < matrix->row_count; row_index++) {
+    for (int column_index = 0; column_index < matrix->column_count;
+         column_index++) {
+      matrix->data[row_index][column_index] =
+          fmaxf(0.0f, matrix->data[row_index][column_index]);
+    }
+  }
 }
 
-// Function to compute derivative of ReLU
-Matrix *relu_derivative(Matrix *m) {
-  Matrix *derivative = allocate_matrix(m->rows, m->cols);
-  for (int i = 0; i < m->rows; i++)
-    for (int j = 0; j < m->cols; j++)
-      derivative->data[i][j] = (m->data[i][j] > 0) ? 1 : 0;
+static Matrix *compute_relu_derivative(const Matrix *matrix) {
+  Matrix *derivative = allocate_matrix(matrix->row_count, matrix->column_count);
+
+  for (int row_index = 0; row_index < matrix->row_count; row_index++) {
+    for (int column_index = 0; column_index < matrix->column_count;
+         column_index++) {
+      derivative->data[row_index][column_index] =
+          (matrix->data[row_index][column_index] > 0.0f) ? 1.0f : 0.0f;
+    }
+  }
+
   return derivative;
 }
 
-// ! Loss Functions
-// Function to compute Mean Squared Error
-float mean_squared_error(Matrix *Y_pred, Matrix *Y_true) {
-  float mse = 0.0f;
-  for (int i = 0; i < Y_pred->rows; i++)
-    for (int j = 0; j < Y_pred->cols; j++)
-      mse += pow(Y_pred->data[i][j] - Y_true->data[i][j], 2);
-  return mse / Y_pred->rows;
+// --- Loss functions ---
+static float compute_mean_squared_error(const Matrix *predicted_output,
+                                        const Matrix *expected_output) {
+  float mean_squared_error = 0.0f;
+
+  for (int row_index = 0; row_index < predicted_output->row_count;
+       row_index++) {
+    for (int column_index = 0; column_index < predicted_output->column_count;
+         column_index++) {
+      float error = predicted_output->data[row_index][column_index] -
+                    expected_output->data[row_index][column_index];
+      mean_squared_error += error * error;
+    }
+  }
+
+  return mean_squared_error / (float)predicted_output->row_count;
 }
 
-// ! Optimization
-// Function to update weights: W = W - learning_rate * grad
-void update_weights(Matrix *W, Matrix *grad, float learning_rate) {
-  for (int i = 0; i < W->rows; i++)
-    for (int j = 0; j < W->cols; j++)
-      W->data[i][j] -= learning_rate * grad->data[i][j];
-}
-
-// Function to perform backpropagation and update weights
-void backpropagation(Matrix *X_batch, Matrix *Y_batch, Matrix *Z1,
-                     Matrix *Y_pred, Matrix *W1, Matrix *W2, int batch_size) {
-  // Compute dZ2 = Y_pred - Y_batch
-  Matrix *dZ2 = mat_sub(Y_pred, Y_batch);
-  mat_scalar_mult(dZ2, 2.0f / batch_size);
-
-  // Compute dW2 = Z1^T * dZ2
-  Matrix *Z1_T = allocate_matrix(Z1->cols, Z1->rows);
-  for (int i = 0; i < Z1->rows; i++) {
-    for (int j = 0; j < Z1->cols; j++) {
-      Z1_T->data[j][i] = Z1->data[i][j];
+// --- Optimization ---
+static void apply_gradient_descent_update(Matrix *weights,
+                                          const Matrix *gradient,
+                                          float learning_rate) {
+  for (int row_index = 0; row_index < weights->row_count; row_index++) {
+    for (int column_index = 0; column_index < weights->column_count;
+         column_index++) {
+      weights->data[row_index][column_index] -=
+          learning_rate * gradient->data[row_index][column_index];
     }
-  }
-  Matrix *dW2 = mat_mult(Z1_T, dZ2);
-  update_weights(W2, dW2, LEARNING_RATE);
-  free_matrix(dW2);
-  free_matrix(Z1_T);
-
-  // Compute dZ1 = dZ2 * W2^T
-  Matrix *W2_T = allocate_matrix(W2->cols, W2->rows);
-  for (int i = 0; i < W2->rows; i++) {
-    for (int j = 0; j < W2->cols; j++) {
-      W2_T->data[j][i] = W2->data[i][j];
-    }
-  }
-  Matrix *dZ1 = mat_mult(dZ2, W2_T);
-
-  // Apply ReLU derivative
-  Matrix *dZ1_derivative = relu_derivative(Z1);
-  for (int i = 0; i < dZ1->rows; i++) {
-    for (int j = 0; j < dZ1->cols; j++) {
-      dZ1->data[i][j] *= dZ1_derivative->data[i][j];
-    }
-  }
-  free_matrix(dZ1_derivative);
-  free_matrix(W2_T);
-
-  // Compute dW1 = X_batch^T * dZ1
-  Matrix *X_batch_T = allocate_matrix(X_batch->cols, X_batch->rows);
-  for (int i = 0; i < X_batch->rows; i++) {
-    for (int j = 0; j < X_batch->cols; j++) {
-      X_batch_T->data[j][i] = X_batch->data[i][j];
-    }
-  }
-  Matrix *dW1 = mat_mult(X_batch_T, dZ1);
-  update_weights(W1, dW1, LEARNING_RATE);
-  free_matrix(dW1);
-  free_matrix(X_batch_T);
-
-  // Free allocated matrices
-  free_matrix(dZ2);
-  free_matrix(dZ1);
-}
-
-// ! Batch Processing
-// Function to get a batch from the dataset
-void get_batch(Matrix *X, Matrix *Y, Matrix *X_batch, Matrix *Y_batch,
-               int batch_start, int batch_size) {
-  for (int i = 0; i < batch_size; i++) {
-    for (int j = 0; j < INPUT_SIZE; j++)
-      X_batch->data[i][j] = X->data[batch_start + i][j];
-    Y_batch->data[i][0] = Y->data[batch_start + i][0];
   }
 }
 
-// ! Data Loading
-// Function to load CSV and populate X and Y, Assuming the last column is Y
-int load_csv(const char *filename, Matrix **X, Matrix **Y, int *num_samples) {
+static void backpropagate_and_update_weights(const Matrix *input_batch,
+                                             const Matrix *target_batch,
+                                             const Matrix *hidden_layer_output,
+                                             const Matrix *predicted_output,
+                                             Matrix *weights_input_to_hidden,
+                                             Matrix *weights_hidden_to_output,
+                                             int batch_size) {
+  Matrix *output_error = matrix_subtract(predicted_output, target_batch);
+  matrix_scale_in_place(output_error, 2.0f / (float)batch_size);
+
+  Matrix *hidden_layer_output_transpose = allocate_matrix(
+      hidden_layer_output->column_count, hidden_layer_output->row_count);
+  for (int row_index = 0; row_index < hidden_layer_output->row_count;
+       row_index++) {
+    for (int column_index = 0; column_index < hidden_layer_output->column_count;
+         column_index++) {
+      hidden_layer_output_transpose->data[column_index][row_index] =
+          hidden_layer_output->data[row_index][column_index];
+    }
+  }
+
+  Matrix *weights_hidden_to_output_gradient =
+      matrix_multiply(hidden_layer_output_transpose, output_error);
+  apply_gradient_descent_update(weights_hidden_to_output,
+                                weights_hidden_to_output_gradient,
+                                LEARNING_RATE);
+
+  free_matrix(weights_hidden_to_output_gradient);
+  free_matrix(hidden_layer_output_transpose);
+
+  Matrix *weights_hidden_to_output_transpose =
+      allocate_matrix(weights_hidden_to_output->column_count,
+                      weights_hidden_to_output->row_count);
+  for (int row_index = 0; row_index < weights_hidden_to_output->row_count;
+       row_index++) {
+    for (int column_index = 0;
+         column_index < weights_hidden_to_output->column_count;
+         column_index++) {
+      weights_hidden_to_output_transpose->data[column_index][row_index] =
+          weights_hidden_to_output->data[row_index][column_index];
+    }
+  }
+
+  Matrix *hidden_layer_error =
+      matrix_multiply(output_error, weights_hidden_to_output_transpose);
+
+  Matrix *relu_derivative_matrix = compute_relu_derivative(hidden_layer_output);
+  for (int row_index = 0; row_index < hidden_layer_error->row_count;
+       row_index++) {
+    for (int column_index = 0; column_index < hidden_layer_error->column_count;
+         column_index++) {
+      hidden_layer_error->data[row_index][column_index] *=
+          relu_derivative_matrix->data[row_index][column_index];
+    }
+  }
+
+  free_matrix(relu_derivative_matrix);
+  free_matrix(weights_hidden_to_output_transpose);
+
+  Matrix *input_batch_transpose =
+      allocate_matrix(input_batch->column_count, input_batch->row_count);
+  for (int row_index = 0; row_index < input_batch->row_count; row_index++) {
+    for (int column_index = 0; column_index < input_batch->column_count;
+         column_index++) {
+      input_batch_transpose->data[column_index][row_index] =
+          input_batch->data[row_index][column_index];
+    }
+  }
+
+  Matrix *weights_input_to_hidden_gradient =
+      matrix_multiply(input_batch_transpose, hidden_layer_error);
+  apply_gradient_descent_update(
+      weights_input_to_hidden, weights_input_to_hidden_gradient, LEARNING_RATE);
+
+  free_matrix(weights_input_to_hidden_gradient);
+  free_matrix(input_batch_transpose);
+
+  free_matrix(output_error);
+  free_matrix(hidden_layer_error);
+}
+
+// --- Dataset utilities ---
+static void copy_mini_batch(const Matrix *input_dataset,
+                            const Matrix *target_dataset, Matrix *input_batch,
+                            Matrix *target_batch, int start_index,
+                            int batch_size) {
+  for (int batch_index = 0; batch_index < batch_size; batch_index++) {
+    for (int feature_index = 0; feature_index < INPUT_SIZE; feature_index++) {
+      input_batch->data[batch_index][feature_index] =
+          input_dataset->data[start_index + batch_index][feature_index];
+    }
+    target_batch->data[batch_index][0] =
+        target_dataset->data[start_index + batch_index][0];
+  }
+}
+
+static int load_dataset_from_csv(const char *filename, Matrix **input_dataset,
+                                 Matrix **target_dataset,
+                                 int *number_of_samples) {
   FILE *file = fopen(filename, "r");
-  if (!file) {
-    printf("Failed to open file.\n");
+  if (file == NULL) {
+    printf("Failed to open file: %s\n", filename);
     return -1;
   }
-  char line[1024];
-  int count = 0;
-  // First pass to count samples
-  while (fgets(line, sizeof(line), file))
-    count++;
-  *num_samples = count;
+
+  char line_buffer[1024];
+  int sample_count = 0;
+  while (fgets(line_buffer, sizeof(line_buffer), file) != NULL) {
+    sample_count++;
+  }
+
+  *number_of_samples = sample_count;
   rewind(file);
-  // Allocate X and Y
-  *X = allocate_matrix(count, INPUT_SIZE);
-  *Y = allocate_matrix(count, OUTPUT_SIZE);
-  int i = 0;
-  while (fgets(line, sizeof(line), file)) {
-    char *token = strtok(line, ",");
-    for (int j = 0; j < INPUT_SIZE; j++) {
-      if (token) {
-        (*X)->data[i][j] = atof(token);
-        token = strtok(NULL, ",");
+
+  *input_dataset = allocate_matrix(sample_count, INPUT_SIZE);
+  *target_dataset = allocate_matrix(sample_count, OUTPUT_SIZE);
+
+  for (int sample_index = 0;
+       sample_index < sample_count &&
+       fgets(line_buffer, sizeof(line_buffer), file) != NULL;
+       sample_index++) {
+    char *token = strtok(line_buffer, ",");
+
+    for (int feature_index = 0; feature_index < INPUT_SIZE; feature_index++) {
+      if (token == NULL) {
+        break;
       }
+      (*input_dataset)->data[sample_index][feature_index] = atof(token);
+      token = strtok(NULL, ",");
     }
-    // Last column as Y
-    if (token)
-      (*Y)->data[i][0] = atof(token);
-    i++;
+
+    if (token != NULL) {
+      (*target_dataset)->data[sample_index][0] = atof(token);
+    }
   }
   fclose(file);
   return 0;
 }
 
-// Main function
 int main(int argc, char *argv[]) {
   if (argc != 2) {
     printf("Usage: %s <data.csv>\n", argv[0]);
     return -1;
   }
 
-  double start_time, end_time;
+  double start_time;
+  double end_time;
 
-  Matrix *X, *Y;
-  int num_samples;
-  if (load_csv(argv[1], &X, &Y, &num_samples) != 0)
+  Matrix *input_dataset = NULL;
+  Matrix *target_dataset = NULL;
+  int number_of_samples = 0;
+
+  if (load_dataset_from_csv(argv[1], &input_dataset, &target_dataset,
+                            &number_of_samples) != 0) {
     return -1;
+  }
 
-  // Allocate and initialize weights
-  Matrix *W1 = allocate_matrix(INPUT_SIZE, HIDDEN_SIZE);
-  Matrix *W2 = allocate_matrix(HIDDEN_SIZE, OUTPUT_SIZE);
-  random_init(W1);
-  random_init(W2);
+  Matrix *weights_input_to_hidden = allocate_matrix(INPUT_SIZE, HIDDEN_SIZE);
+  Matrix *weights_hidden_to_output = allocate_matrix(HIDDEN_SIZE, OUTPUT_SIZE);
+  random_initialize_matrix(weights_input_to_hidden);
+  random_initialize_matrix(weights_hidden_to_output);
 
-  // Start measuring time
   start_time = omp_get_wtime();
 
-  // Training loop
-  for (int epoch = 0; epoch < EPOCHS; epoch++) {
-    for (int batch_start = 0; batch_start < num_samples;
-         batch_start += BATCH_SIZE) {
-      int batch_end = fmin(batch_start + BATCH_SIZE, num_samples);
-      int batch_size = batch_end - batch_start;
+  for (int epoch_index = 0; epoch_index < EPOCHS; epoch_index++) {
+    for (int batch_start_index = 0; batch_start_index < number_of_samples;
+         batch_start_index += BATCH_SIZE) {
+      int batch_end_index = batch_start_index + BATCH_SIZE;
+      if (batch_end_index > number_of_samples) {
+        batch_end_index = number_of_samples;
+      }
 
-      // Extract batch
-      Matrix *X_batch = allocate_matrix(BATCH_SIZE, INPUT_SIZE);
-      Matrix *Y_batch = allocate_matrix(BATCH_SIZE, OUTPUT_SIZE);
-      get_batch(X, Y, X_batch, Y_batch, batch_start, batch_size);
+      int batch_size = batch_end_index - batch_start_index;
 
-      // Forward pass: X -> Hidden Layer -> ReLU -> Output Layer
-      Matrix *Z1 = mat_mult(X_batch, W1);
-      relu(Z1);
-      Matrix *Y_pred = mat_mult(Z1, W2);
+      Matrix *input_batch = allocate_matrix(batch_size, INPUT_SIZE);
+      Matrix *target_batch = allocate_matrix(batch_size, OUTPUT_SIZE);
+      copy_mini_batch(input_dataset, target_dataset, input_batch, target_batch,
+                      batch_start_index, batch_size);
 
-      // Compute loss
-      float loss = mean_squared_error(Y_pred, Y_batch);
-      if (epoch % LOG_EVERY_EPOCH == 0 && batch_start == 0)
-        printf("Epoch %d, MSE: %f\n", epoch, loss);
+      Matrix *hidden_layer_output =
+          matrix_multiply(input_batch, weights_input_to_hidden);
+      apply_relu_in_place(hidden_layer_output);
+      Matrix *predicted_output =
+          matrix_multiply(hidden_layer_output, weights_hidden_to_output);
 
-      // Backward pass
-      backpropagation(X_batch, Y_batch, Z1, Y_pred, W1, W2, batch_size);
+      float mean_squared_error =
+          compute_mean_squared_error(predicted_output, target_batch);
+      if (epoch_index % LOG_EVERY_EPOCH == 0 && batch_start_index == 0) {
+        printf("Epoch %d, MSE: %f\n", epoch_index, mean_squared_error);
+      }
 
-      // Free allocated matrices
-      free_matrix(Z1);
-      free_matrix(Y_pred);
-      free_matrix(X_batch);
-      free_matrix(Y_batch);
+      backpropagate_and_update_weights(
+          input_batch, target_batch, hidden_layer_output, predicted_output,
+          weights_input_to_hidden, weights_hidden_to_output, batch_size);
+
+      free_matrix(hidden_layer_output);
+      free_matrix(predicted_output);
+      free_matrix(input_batch);
+      free_matrix(target_batch);
     }
   }
 
-  // Stop measuring time
   end_time = omp_get_wtime();
 
   printf("Parallel Training time: %.4f seconds\n", end_time - start_time);
 
-  // Cleanup
-  free_matrix(W1);
-  free_matrix(W2);
-  free_matrix(X);
-  free_matrix(Y);
+  free_matrix(weights_input_to_hidden);
+  free_matrix(weights_hidden_to_output);
+  free_matrix(input_dataset);
+  free_matrix(target_dataset);
 
   return 0;
 }

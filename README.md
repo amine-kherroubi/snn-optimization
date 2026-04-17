@@ -1,6 +1,6 @@
 # Memory Management Strategies for GPU-Accelerated Shallow Neural Network Training
 
-This project evaluates memory management optimizations for CUDA-based shallow neural network training, conducted at the École Nationale Supérieure d'Informatique (ESI), Algiers, in February 2026. Building upon the reference implementation by Brouthen and Akeb [1], we investigate three optimization strategies that address GPU memory allocation overhead and transfer efficiency.
+This project evaluates memory management optimizations for CUDA-based shallow neural network training, conducted at the École Nationale Supérieure d'Informatique (ESI), Algiers, in January 2026. Building upon the reference implementation by Brouthen and Akeb [1], we investigate three optimization strategies that address GPU memory allocation overhead and transfer efficiency.
 
 ## Overview
 
@@ -56,7 +56,7 @@ The program outputs average training time and final MSE over 10 independent runs
 
 ## Authors
 
-Mohamed El Amine Kherroubi, Badis Khalef, Mounir Sofiane Mostefai, Youcef Tati, Mohamed Ishak Messadia  
+Mohamed El Amine Kherroubi, Badis Khalef, Mounir Sofiane Mostefai, Youcef Tati, Mohamed Ishak Messadia
 2CS-SIQ/SID, École Nationale Supérieure d'Informatique (ESI), Algiers
 
 ## Acknowledgments

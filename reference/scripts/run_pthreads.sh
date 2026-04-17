@@ -8,7 +8,7 @@ gcc -o ../nn_pthreads ../nn_pthreads.c -lm -pthread -pg -fopenmp
 
 echo "Small Dataset (256 samples)"
 ../nn_pthreads ../data/synthetic_convex_small.csv
-echo 
+echo
 
 # echo "Medium Dataset (1024 samples)"
 # ../nn_pthreads ../data/synthetic_convex_medium.csv

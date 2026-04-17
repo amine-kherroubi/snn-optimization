@@ -1,57 +1,64 @@
-import os
+from __future__ import annotations
+
+from enum import Enum
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-from enum import Enum
 
-# Set random seed for reproducibility
-np.random.seed(42)
-
-# Parameters
-num_samples = int(256 * 100)  # Number of samples
-num_features = 32  # Number of input features
-noise_std = 0.1  # Standard deviation of Gaussian noise
-input_scale = 1  # Scale of input features
-
-# Generate random input features
-X = np.random.uniform(-input_scale, input_scale, size=(num_samples, num_features))
+RANDOM_SEED = 42
+NUMBER_OF_SAMPLES = 256 * 100
+NUMBER_OF_FEATURES = 32
+NOISE_STANDARD_DEVIATION = 0.1
+INPUT_FEATURE_SCALE = 1.0
 
 
-# Define an enum for function choices
 class TargetFunction(Enum):
     CONVEX = "convex"
 
 
-# Define target functions
-def convex_target_function(x):
-    return np.sum(x**2, axis=1)
+def convex_target_function(input_features: np.ndarray) -> np.ndarray:
+    return np.sum(input_features**2, axis=1)
 
 
-# Function to select the target function
-def compute_target(function_choice, x):
-    if function_choice == TargetFunction.CONVEX:
-        return convex_target_function(x)
-    else:
-        raise ValueError("Invalid function choice")
+def compute_target(
+    target_function: TargetFunction, input_features: np.ndarray
+) -> np.ndarray:
+    if target_function == TargetFunction.CONVEX:
+        return convex_target_function(input_features)
+    raise ValueError(f"Unsupported target function: {target_function}")
 
 
-# Choose the target function to use
-function_choice = TargetFunction.CONVEX
+def main() -> None:
+    np.random.seed(RANDOM_SEED)
 
-# Compute target variable with noise
-Y = compute_target(function_choice, X) + np.random.normal(
-    0, noise_std, size=num_samples
-)
+    input_features = np.random.uniform(
+        -INPUT_FEATURE_SCALE,
+        INPUT_FEATURE_SCALE,
+        size=(NUMBER_OF_SAMPLES, NUMBER_OF_FEATURES),
+    )
 
-# Create a DataFrame
-columns = [f"X{i+1}" for i in range(num_features)] + ["Y"]
-data = np.hstack((X, Y.reshape(-1, 1)))
-df = pd.DataFrame(data, columns=columns)
+    target_function = TargetFunction.CONVEX
+    target_values = compute_target(target_function, input_features) + np.random.normal(
+        0,
+        NOISE_STANDARD_DEVIATION,
+        size=NUMBER_OF_SAMPLES,
+    )
 
-# Save to CSV
-os.makedirs("reference/data", exist_ok=True)
-df.to_csv(
-    f"reference/data/synthetic_{function_choice.value}_large.csv",
-    index=False,
-    header=False,
-)
-print(f"Dataset 'synthetic_{function_choice.value}_large.csv' generated successfully.")
+    column_names = [
+        *(f"input_feature_{index + 1}" for index in range(NUMBER_OF_FEATURES)),
+        "target",
+    ]
+    dataset_values = np.hstack((input_features, target_values.reshape(-1, 1)))
+    data_frame = pd.DataFrame(dataset_values, columns=column_names)
+
+    output_directory = Path("reference") / "data"
+    output_directory.mkdir(parents=True, exist_ok=True)
+
+    output_file_path = output_directory / f"synthetic_{target_function.value}_large.csv"
+    data_frame.to_csv(output_file_path, index=False, header=False)
+    print(f"Generated dataset: {output_file_path}")
+
+
+if __name__ == "__main__":
+    main()
