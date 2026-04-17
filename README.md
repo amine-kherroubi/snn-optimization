@@ -159,6 +159,6 @@ This command:
 Mohamed El Amine Kherroubi, Badis Khalef, Mounir Sofiane Mostefai, Youcef Tati, Mohamed Ishak Messadia
 2CS-SIQ/SID, École Nationale Supérieure d'Informatique (ESI), Algiers
 
-## 10. Reference
+## 10. References
 
 [1] Brouthen, K., & Akeb, A. (2024). Exploring parallelization of shallow neural network using CUDA.
