@@ -2,6 +2,8 @@
 
 A complete CUDA research case study on memory management optimizations for a shallow neural network. This repository compares a reference GPU implementation against optimized variants that reduce allocation overhead, improve memory transfer, and use CUDA streams.
 
+<img width="1628" height="774" alt="project" src="https://github.com/user-attachments/assets/34366123-9a66-4998-9b01-729da7ad79e8" />
+
 ## 1. What is this project?
 
 1. A performance study of memory management in CUDA-based shallow neural network training.
