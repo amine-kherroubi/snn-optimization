@@ -141,7 +141,7 @@ This command:
    - `data/` contains `synthetic_convex_small.csv`, `synthetic_convex_medium.csv`, and `synthetic_convex_large.csv`.
 3. `report/`
    - Final article source and report materials.
-4. `full_project.ipynb`
+4. `run_full_project.ipynb`
    - Notebook for analysis and visualization.
 5. `python_requirements.txt`
    - Python dependencies for optional analysis.
@@ -159,6 +159,6 @@ This command:
 Mohamed El Amine Kherroubi, Badis Khalef, Mounir Sofiane Mostefai, Youcef Tati, Mohamed Ishak Messadia
 2CS-SIQ/SID, École Nationale Supérieure d'Informatique (ESI), Algiers
 
-## 10. Reference
+## 10. References
 
 [1] Brouthen, K., & Akeb, A. (2024). Exploring parallelization of shallow neural network using CUDA.
